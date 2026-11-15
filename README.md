@@ -1,9 +1,10 @@
 🌐 Estudos Django
 
-Esse repositório é voltado ao meu aprendizado Django. Colocarei aqui os projetos desenvolvidos junto com o oprofessor e meus projetos pessoais utilizando esse Flamework.
+Esse repositório é voltado ao meu aprendizado Django. Colocarei aqui os projetos desenvolvidos junto com o oprofessor e meus projetos pessoais utilizando o Flamework: Django.
 No futuro eu pretendo colocar, junto com o Django, outros Flameworks Web Python: Flask, FastAPI, Pyramid, Web2py, Bottle, CherryPy, Tornado e Falcon.
 
-Aqui registro exercícios, projetos e aplicações desenvolvidas durante minha jornada de aprendizado utilizando Django.
+Os projetos que tenham no inicio da nomecratura "curso" foram desemvolvidos junto com o professor ao longo das aulas.
+Todos os outros são *Autorais*
 
 Conteúdo
 URLs
