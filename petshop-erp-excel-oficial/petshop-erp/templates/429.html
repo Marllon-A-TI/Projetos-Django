@@ -1,0 +1,10 @@
+{% extends "base_auth.html" %}
+{% block title %}Muitas tentativas{% endblock %}
+{% block content %}
+<h2 class="h5">Muitas tentativas de login</h2>
+<p class="text-muted">
+  Por segurança, novas tentativas deste endereço estão bloqueadas por alguns
+  minutos (até 15). Aguarde e tente novamente.
+</p>
+<a class="btn btn-primary w-100" href="{% url 'accounts:login' %}">Voltar ao login</a>
+{% endblock %}

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Alterar senha{% endblock %}
+{% block content %}
+<h1 class="h3 mb-3">Alterar senha</h1>
+<div class="row"><div class="col-lg-5">
+  <div class="card"><div class="card-body">
+    <form method="post" novalidate data-evitar-duplo-envio>
+      {% csrf_token %}
+      {% include "partials/form_corpo.html" with coluna="col-12" %}
+      <div class="d-flex gap-2 mt-3">
+        <button type="submit" class="btn btn-primary">Salvar nova senha</button>
+        <a class="btn btn-outline-secondary" href="{% url 'core:home' %}">Cancelar</a>
+      </div>
+    </form>
+  </div></div>
+</div></div>
+{% endblock %}

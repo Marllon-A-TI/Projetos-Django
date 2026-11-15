@@ -1,0 +1,96 @@
+{% load static core_tags %}<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Pet Shop ERP{% endblock %} · Pet Shop ERP</title>
+  <link rel="stylesheet" href="{% static 'vendor/bootstrap/bootstrap.min.css' %}">
+  <link rel="stylesheet" href="{% static 'css/app.css' %}">
+  {% block extra_head %}{% endblock %}
+</head>
+<body class="bg-body-tertiary">
+{% with ns=request.resolver_match.namespace %}
+<nav class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top d-print-none">
+  <div class="container-fluid px-3 px-lg-4">
+    <a class="navbar-brand" href="{% url 'core:home' %}">Pet Shop ERP</a>
+
+    {% if user.is_authenticated %}
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+            data-bs-target="#menuPrincipal" aria-controls="menuPrincipal"
+            aria-expanded="false" aria-label="Abrir menu">
+      <span class="navbar-toggler-icon"></span>
+    </button>
+
+    <div class="collapse navbar-collapse" id="menuPrincipal">
+      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+        {% if user|eh_administrador %}
+        <li class="nav-item"><a class="nav-link {% if ns == 'dashboard' %}active{% endif %}" href="{% url 'dashboard:index' %}">Dashboard</a></li>
+        <li class="nav-item dropdown">
+          <a class="nav-link dropdown-toggle {% if ns == 'produtos' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">Produtos</a>
+          <ul class="dropdown-menu">
+            <li><a class="dropdown-item" href="{% url 'produtos:list' %}">Lista de produtos</a></li>
+            <li><a class="dropdown-item" href="{% url 'produtos:importar' %}">Importar Excel</a></li>
+            <li><a class="dropdown-item" href="{% url 'produtos:exportar' %}">Exportar Excel</a></li>
+          </ul>
+        </li>
+        <li class="nav-item"><a class="nav-link {% if ns == 'estoque' %}active{% endif %}" href="{% url 'estoque:list' %}">Estoque</a></li>
+        <li class="nav-item"><a class="nav-link {% if ns == 'vendas' %}active{% endif %}" href="{% url 'vendas:list' %}">Vendas</a></li>
+        <li class="nav-item dropdown">
+          <a class="nav-link dropdown-toggle {% if ns == 'financeiro' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">Financeiro</a>
+          <ul class="dropdown-menu">
+            <li><a class="dropdown-item" href="{% url 'financeiro:pagar_list' %}">Contas a pagar</a></li>
+            <li><a class="dropdown-item" href="{% url 'financeiro:receber_list' %}">Contas a receber</a></li>
+            <li><a class="dropdown-item" href="{% url 'financeiro:caixa_list' %}">Fluxo de caixa</a></li>
+          </ul>
+        </li>
+        <li class="nav-item"><a class="nav-link {% if ns == 'accounts' %}active{% endif %}" href="{% url 'accounts:usuario_list' %}">Usuários</a></li>
+        <li class="nav-item"><a class="nav-link {% if ns == 'logs' %}active{% endif %}" href="{% url 'logs:list' %}">Logs</a></li>
+        {% else %}
+        <li class="nav-item"><a class="nav-link {% if ns == 'core' %}active{% endif %}" href="{% url 'core:home' %}">Início</a></li>
+        <li class="nav-item"><a class="nav-link {% if ns == 'produtos' %}active{% endif %}" href="{% url 'produtos:list' %}">Produtos</a></li>
+        <li class="nav-item"><a class="nav-link {% if ns == 'vendas' %}active{% endif %}" href="{% url 'vendas:list' %}">Minhas vendas</a></li>
+        {% endif %}
+        <li class="nav-item ms-lg-2"><a class="btn btn-light btn-sm mt-1 mt-lg-0" href="{% url 'vendas:create' %}">Nova venda</a></li>
+      </ul>
+
+      <ul class="navbar-nav">
+        <li class="nav-item dropdown">
+          <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+            {{ user.get_full_name|default:user.username }}
+          </a>
+          <ul class="dropdown-menu dropdown-menu-end">
+            <li><span class="dropdown-item-text small text-muted">{% if user|eh_administrador %}Administrador{% else %}Vendedor{% endif %}</span></li>
+            <li><a class="dropdown-item" href="{% url 'accounts:alterar_senha' %}">Alterar senha</a></li>
+            {% if user.is_staff %}
+            <li><a class="dropdown-item" href="{% url 'admin:index' %}">Painel do Django</a></li>
+            {% endif %}
+            <li><hr class="dropdown-divider"></li>
+            <li>
+              <form method="post" action="{% url 'accounts:logout' %}">
+                {% csrf_token %}
+                <button type="submit" class="dropdown-item">Sair</button>
+              </form>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </div>
+    {% else %}
+    <a class="btn btn-light btn-sm" href="{% url 'accounts:login' %}">Entrar</a>
+    {% endif %}
+  </div>
+</nav>
+{% endwith %}
+
+<main class="container-fluid px-3 px-lg-4 py-3">
+  {% include "partials/mensagens.html" %}
+  {% block content %}{% endblock %}
+</main>
+
+<footer class="text-center text-muted small py-3 d-print-none">Pet Shop ERP</footer>
+
+<script src="{% static 'vendor/bootstrap/bootstrap.bundle.min.js' %}"></script>
+<script src="{% static 'js/app.js' %}"></script>
+{% block extra_js %}{% endblock %}
+</body>
+</html>

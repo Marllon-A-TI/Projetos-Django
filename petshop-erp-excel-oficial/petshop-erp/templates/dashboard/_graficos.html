@@ -1,0 +1,21 @@
+{% load static %}
+{# Os períodos abaixo devem ficar em sincronia com as constantes de dashboard/services.py #}
+<h2 class="h6 text-uppercase text-muted">Gráficos</h2>
+
+<div id="graficos-erro" class="alert alert-warning d-none" role="alert">
+  Não foi possível carregar a biblioteca de gráficos. Verifique se o arquivo
+  <code>static/vendor/chartjs/chart.umd.min.js</code> existe e tem conteúdo.
+</div>
+
+<div class="row g-3 mb-4">
+  {% include "dashboard/_grafico_card.html" with titulo="Vendas por dia" subtitulo="últimos 30 dias" canvas_id="grafico-vendas-dia" largura=8 %}
+  {% include "dashboard/_grafico_card.html" with titulo="Produtos mais vendidos" subtitulo="últimos 90 dias" canvas_id="grafico-mais-vendidos" largura=4 %}
+  {% include "dashboard/_grafico_card.html" with titulo="Vendas por mês" subtitulo="últimos 12 meses" canvas_id="grafico-vendas-mes" largura=6 %}
+  {% include "dashboard/_grafico_card.html" with titulo="Faturamento mensal" subtitulo="últimos 12 meses" canvas_id="grafico-faturamento-mensal" largura=6 %}
+  {% include "dashboard/_grafico_card.html" with titulo="Quantidade de produtos por item" subtitulo="maiores estoques" canvas_id="grafico-produtos-quantidade" largura=6 %}
+  {% include "dashboard/_grafico_card.html" with titulo="Valor em estoque" subtitulo="a preço de custo" canvas_id="grafico-valor-estoque" largura=6 %}
+</div>
+
+{{ graficos|json_script:"dados-graficos" }}
+<script src="{% static 'vendor/chartjs/chart.umd.min.js' %}"></script>
+<script src="{% static 'js/dashboard.js' %}"></script>

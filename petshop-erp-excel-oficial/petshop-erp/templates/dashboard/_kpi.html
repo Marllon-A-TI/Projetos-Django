@@ -1,0 +1,10 @@
+{% load core_tags %}
+<div class="col-6 col-lg-{{ largura|default:3 }}">
+  <div class="card h-100 shadow-sm">
+    <div class="card-body">
+      <div class="text-muted small">{{ titulo }}</div>
+      <div class="kpi-valor text-money {{ destaque }}">{% if dinheiro %}{{ valor|moeda }}{% else %}{{ valor }}{% endif %}</div>
+      {% if detalhe_rotulo %}<div class="small text-muted">{{ detalhe_rotulo }}: {{ detalhe_valor|moeda }}</div>{% endif %}
+    </div>
+  </div>
+</div>

@@ -1,0 +1,26 @@
+<tr class="item-venda{% if form.DELETE.value %} d-none{% endif %}">
+  <td>
+    {% for oculto in form.hidden_fields %}{{ oculto }}{% endfor %}
+    {{ form.produto }}
+    {% for erro in form.produto.errors %}<div class="invalid-feedback d-block">{{ erro }}</div>{% endfor %}
+    {% for erro in form.non_field_errors %}<div class="invalid-feedback d-block">{{ erro }}</div>{% endfor %}
+  </td>
+  <td>
+    {{ form.quantidade }}
+    <div class="form-text estoque-info"></div>
+    {% for erro in form.quantidade.errors %}<div class="invalid-feedback d-block">{{ erro }}</div>{% endfor %}
+  </td>
+  <td class="text-end">
+    {% if form.preco %}
+      {{ form.preco }}
+      {% for erro in form.preco.errors %}<div class="invalid-feedback d-block">{{ erro }}</div>{% endfor %}
+    {% else %}
+      <span class="preco-texto text-money">-</span>
+    {% endif %}
+  </td>
+  <td class="text-end text-money subtotal">R$ 0,00</td>
+  <td class="text-end">
+    <span class="d-none">{{ form.DELETE }}</span>
+    <button type="button" class="btn btn-outline-danger btn-sm remover-item" aria-label="Remover item">&times;</button>
+  </td>
+</tr>
