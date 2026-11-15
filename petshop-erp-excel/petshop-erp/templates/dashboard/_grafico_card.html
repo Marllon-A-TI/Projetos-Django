@@ -1,0 +1,13 @@
+<div class="col-12 col-lg-{{ largura|default:6 }}">
+  <div class="card h-100 shadow-sm">
+    <div class="card-header fw-semibold">
+      {{ titulo }}{% if subtitulo %}<span class="text-muted fw-normal small"> · {{ subtitulo }}</span>{% endif %}
+    </div>
+    <div class="card-body">
+      <div class="grafico-box">
+        <canvas id="{{ canvas_id }}" role="img" aria-label="{{ titulo }}"></canvas>
+      </div>
+      <div class="grafico-vazio text-muted text-center py-5 d-none">Sem dados para exibir.</div>
+    </div>
+  </div>
+</div>

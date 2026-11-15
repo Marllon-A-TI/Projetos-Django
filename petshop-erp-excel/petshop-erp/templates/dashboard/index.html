@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% load core_tags %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+  <h1 class="h3 mb-0">Dashboard</h1>
+  <span class="text-muted small">Atualizado em {{ atualizado_em|date:"d/m/Y H:i" }}</span>
+</div>
+
+<h2 class="h6 text-uppercase text-muted">Vendas</h2>
+<div class="row g-3 mb-4">
+  {% include "dashboard/_kpi.html" with titulo="Vendas hoje" valor=kpis.vendas_dia largura=2 %}
+  {% include "dashboard/_kpi.html" with titulo="Vendas no mês" valor=kpis.vendas_mes largura=2 %}
+  {% include "dashboard/_kpi.html" with titulo="Vendas no ano" valor=kpis.vendas_ano largura=2 %}
+  {% include "dashboard/_kpi.html" with titulo="Faturamento hoje" valor=kpis.faturamento_dia dinheiro=True largura=2 %}
+  {% include "dashboard/_kpi.html" with titulo="Faturamento no mês" valor=kpis.faturamento_mes dinheiro=True largura=2 %}
+  {% include "dashboard/_kpi.html" with titulo="Faturamento no ano" valor=kpis.faturamento_ano dinheiro=True largura=2 %}
+</div>
+
+<h2 class="h6 text-uppercase text-muted">Estoque</h2>
+<div class="row g-3 mb-4">
+  {% include "dashboard/_kpi.html" with titulo="Produtos cadastrados" valor=kpis.produtos_cadastrados largura=3 %}
+  {% include "dashboard/_kpi.html" with titulo="Unidades em estoque" valor=kpis.total_produtos largura=3 %}
+  {% include "dashboard/_kpi.html" with titulo="Valor em estoque (custo)" valor=kpis.valor_total_estoque dinheiro=True largura=3 %}
+  {% if kpis.produtos_estoque_baixo %}
+    {% include "dashboard/_kpi.html" with titulo="Produtos com estoque baixo" valor=kpis.produtos_estoque_baixo destaque="text-danger" largura=3 %}
+  {% else %}
+    {% include "dashboard/_kpi.html" with titulo="Produtos com estoque baixo" valor=kpis.produtos_estoque_baixo largura=3 %}
+  {% endif %}
+</div>
+
+<h2 class="h6 text-uppercase text-muted">Financeiro</h2>
+<div class="row g-3 mb-4">
+  {% include "dashboard/_kpi.html" with titulo="Contas a pagar (pendentes)" valor=kpis.contas_pagar dinheiro=True detalhe_rotulo="Em atraso" detalhe_valor=kpis.contas_pagar_atrasadas largura=4 %}
+  {% include "dashboard/_kpi.html" with titulo="Contas a receber (pendentes)" valor=kpis.contas_receber dinheiro=True detalhe_rotulo="Em atraso" detalhe_valor=kpis.contas_receber_atrasadas largura=4 %}
+  {% include "dashboard/_kpi.html" with titulo="Saldo do caixa" valor=kpis.saldo_caixa dinheiro=True largura=4 %}
+</div>
+
+{% if estoque_baixo_lista %}
+<div class="card mb-4">
+  <div class="card-header fw-semibold">Produtos com estoque baixo</div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr><th>Produto</th><th class="text-end">Estoque</th><th class="text-end">Mínimo</th><th></th></tr></thead>
+      <tbody>
+        {% for p in estoque_baixo_lista %}
+        <tr>
+          <td><a href="{% url 'produtos:detail' p.pk %}">{{ p }}</a></td>
+          <td class="text-end text-danger fw-semibold">{{ p.quantidade|default_if_none:0 }}</td>
+          <td class="text-end">{{ p.estoque_minimo }}</td>
+          <td class="text-end"><a class="btn btn-sm btn-outline-primary" href="{% url 'estoque:create' %}?produto={{ p.pk }}&amp;tipo=ENTRADA">Repor</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+{% include "dashboard/_graficos.html" %}
+{% endblock %}

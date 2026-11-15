@@ -1,0 +1,2577 @@
+diff -ruN -x __pycache__ -x .env -x var a/RELATORIO.md b/RELATORIO.md
+--- a/RELATORIO.md	1969-12-31 21:00:00.000000000 -0300
++++ b/RELATORIO.md	2026-11-11 20:28:09.392059367 -0300
+@@ -0,0 +1,124 @@
++# Pet Shop ERP: diagnóstico, produção e Excel
++
++Baseado na leitura do projeto real enviado (`petshop-erp.zip`). Nada foi inventado: onde algo não pôde ser verificado, está dito.
++
++## 1. Diagnóstico da arquitetura
++
++**Apps (8):** `core` (mixins, base de models, middleware de acesso, filtros), `accounts` (usuários e grupos), `produtos`, `estoque`, `vendas`, `financeiro`, `dashboard`, `logs`. Django 5.2, PostgreSQL via `psycopg 3`, `gunicorn`, `whitenoise`, `python-decouple`. Sem JavaScript de build: Bootstrap e Chart.js locais em `static/vendor`.
++
++**Padrões em uso (todos devem ser preservados):**
++
++- **Class Based Views** finas, com mixins de `core/mixins.py`; listagens com `FiltroListViewMixin` + um `FiltroForm` com método `filtrar()`.
++- **Models-base** em `core/models.py`: `ModeloBase` (criado/atualizado), `ModeloProtegido` (não exclui), `ModeloImutavel` (não altera nem exclui; `update()` e `delete()` em lote bloqueados). Usados por `MovimentacaoEstoque`, `LogAcao`, `Venda`, `ItemVenda`, `FluxoCaixa`.
++- **Regra de ouro do estoque:** `Produto.quantidade` não pode ser gravada por `save()` (levanta `EstoqueProtegidoError`); só `MovimentacaoEstoque.registrar()` altera o saldo, com `select_for_update`, histórico imutável e *constraints* no banco que garantem saldo consistente.
++- **Serviços em classmethod** com `transaction.atomic` (`Venda.registrar_venda`, `MovimentacaoEstoque.registrar`) e módulo de serviços no dashboard.
++- **Templates** com `base.html` (navbar Bootstrap, perfil decide o menu), parciais (`campo`, `form_corpo`, `filtro`, `paginacao`, `mensagens`) e filtros em `core_tags`.
++
++**Permissões (3 camadas):** (1) `ControleAcessoMiddleware` define o perfil mínimo por app (`PERFIS_POR_APP`); (2) cada view usa `AdministradorRequiredMixin` ou `VendedorOuAdministradorRequiredMixin` (login → redireciona; sem perfil → 403); (3) os templates escondem o que o perfil não pode usar. Perfis = grupos `Administrador` e `Vendedor` (`accounts/models.py`, criados por `manage.py criar_grupos`); superusuário passa em tudo. Importante: o app `produtos` está liberado para Vendedor na camada 1, então **qualquer view nova de produtos que seja só de administrador precisa do mixin na própria view**.
++
++**Logs:** `LogAcao` (imutável) guarda usuário, ação, IP, data e descrição. Gravação por `registrar_acao(request, acao, descricao)` ou `LogFormValidMixin` (grava na mesma transação do objeto). `AuditoriaMiddleware` calcula o IP (`CLIENT_IP_HEADER`), bloqueia excesso de logins errados (429) e audita POSTs do `/admin/`; sinais registram login/logout/falha. Há também log de aplicação em `var/log/petshop.log` com rotação.
++
++## 2. Diagnóstico de Produtos
++
++`Produto`: nome, código de barras, categoria, fornecedor, quantidade (protegida), estoque mínimo, preço de custo/venda (≥ 0 por constraint), ativo. Índices em nome, código e categoria. **O código de barras não é único no banco**; a unicidade é só validada no `ProdutoForm`.
++CRUD: lista (filtros, paginação 25; vendedor só vê ativos e não vê custo), detalhe, criar/editar (só admin, com log; estoque inicial vira movimentação de ENTRADA), ativar/desativar, excluir (bloqueado se houver movimentações/vendas).
++
++## 3. Diagnóstico da infraestrutura atual
++
++Já existia e está bem feito: `deploy/` (Gunicorn em `127.0.0.1:8000`, serviço systemd, `atualizar.sh`, exemplo de Caddyfile e de `.env` de produção), `scripts/` (backup diário com `pg_dump`, retenção, restauração e teste de restauração), `settings.py` guiado por `.env` (DEBUG falso por padrão, HSTS, cookies seguros, proxy). **Então a hospedagem não exige mudança de código.**
++
++**O que o projeto não tinha:** nenhuma parte de Excel. O módulo de produtos terminava no CRUD, o `LogAcao` não tinha ações de importação/exportação e o `openpyxl` não estava no `requirements.txt`. Tudo isso foi criado agora, reaproveitando `ModeloImutavel`, `registrar_acao`, os mixins de perfil, `BootstrapFormMixin` e os parciais de template existentes.
++
++## 4. Plano de hospedagem
++
++Ver **`deploy/ORACLE_CLOUD.md`** (passo a passo, firewall, Caddy/Nginx, SSL, backup, custos, limites). Resumo: uma VM Ampere A1 (1 OCPU/6 GB) com Ubuntu 24.04, PostgreSQL local, Gunicorn, Caddy; custo R$ 0 (domínio opcional). Dois alertas: o Always Free hoje é **2 OCPU/12 GB** (não 4/24) e instâncias ociosas podem ser recuperadas, por isso o **backup externo é obrigatório**.
++
++## 5. Alterações necessárias para produção
++
++Nenhuma no código. Só configuração no `.env` (modelo em `deploy/env.producao.exemplo`): `DJANGO_DEBUG=False`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_CSRF_TRUSTED_ORIGINS`, nova `DJANGO_SECRET_KEY`, `DJANGO_ADMIN_URL`, `CLIENT_IP_HEADER=HTTP_X_FORWARDED_FOR`, cookies seguros e SSL redirect ligados.
++
++## 6. Importar Excel (implementado)
++
++Menu **Produtos → Importar Excel** (somente Administrador). Fluxo: upload → validações do arquivo (extensão, 5 MB, é um zip `.xlsx` real, tamanho descompactado) → leitura em modo *read-only* linha a linha → validação de **todas** as linhas → só então grava, em uma `transaction.atomic`.
++
++- **Chave:** código de barras. **Obrigatórias:** Código de barras, Nome, Estoque, Preço de venda. **Opcionais:** Categoria, Fornecedor, Estoque mínimo, Preço de custo, Ativo. Cabeçalhos aceitam variações sem acento (ex.: "EAN", "Quantidade", "Preço").
++- **Valida:** colunas ausentes/duplicadas, vazios, tipos, negativos, casas decimais, tamanhos de texto, duplicidade na planilha, duplicidade no cadastro, limite de 20.000 linhas. Mostra até 100 erros com o número da linha; qualquer erro = nada é gravado.
++- **Produto existente:** atualiza preço de venda, preço de custo (se informado) e estoque; **preserva** nome, categoria, fornecedor, estoque mínimo e situação.
++- **Produto novo:** criado com `bulk_create`.
++- **Estoque respeita a regra do projeto:** nada de `save()` em `quantidade`. Existente recebe movimentação **AJUSTE** (a planilha vira o saldo contado); novo recebe **ENTRADA**. Isso é feito por `MovimentacaoEstoque.registrar_lote()` (novo, em lote: `select_for_update` + `bulk_create` + `bulk_update`), então o histórico e as constraints continuam valendo.
++- **Log:** uma ação `IMPORTACAO` com arquivo e contagens, gravada na mesma transação.
++- **Desempenho:** a leitura/validação de 20.000 linhas levou ~1 s no teste; consultas em lotes de 2.000, gravação em lotes de 1.000.
++
++## 7. Exportar Excel (implementado)
++
++Menu **Produtos → Exportar Excel**: download imediato (GET), todos os produtos (inclusive inativos), as 9 colunas do model, em ordem de nome. Só Administrador (inclui preço de custo). Textos gravados como texto (zeros à esquerda preservados e **sem execução de fórmulas** se o nome começar com `=`, `+`, `-`, `@`). Cabeçalho `Cache-Control: no-store`. Gera log `EXPORTACAO`. O arquivo exportado é o modelo da importação (exportar → editar → importar funciona).
++
++## 8. Arquivos alterados
++
++| Arquivo | Mudança |
++|---|---|
++| `requirements.txt` | `+ openpyxl>=3.1,<4.0` (única dependência nova) |
++| `logs/models.py` | `+ IMPORTACAO`, `+ EXPORTACAO` em `LogAcao.Acao` |
++| `logs/migrations/0003_alter_logacao_acao.py` | **novo**: só atualiza as `choices` (sem alterar tabelas); rode `migrate` |
++| `estoque/models.py` | `+ MovimentacaoEstoque.registrar_lote()` e `import timezone` |
++| `produtos/excel.py` | **novo**: lê/valida/gera XLSX (só openpyxl, sem Django, sem banco) |
++| `produtos/importacao.py` | **novo**: grava a importação (atômica, em lote, via movimentações) |
++| `templates/produtos/produto_importar.html` | **novo**: tela de importação (layout padrão do projeto) |
++| `produtos/forms.py` | `+ ImportarProdutosForm` |
++| `produtos/views.py` | `+ ProdutoImportarView`, `+ ProdutoExportarView` |
++| `produtos/urls.py` | `+ importar/`, `+ exportar/` |
++| `templates/base.html` | "Produtos" vira dropdown (só administrador) |
++| `produtos/tests.py` | 11 testes novos |
++| `deploy/ORACLE_CLOUD.md`, `RELATORIO.md` | documentação |
++
++O diff exato está em `alteracoes.patch` (a nova migração, `excel.py`, `importacao.py` e o template aparecem como arquivos novos).
++
++## 9. Novas URLs, forms, views, templates e menu
++
++- URLs: `produtos:importar` (`/produtos/importar/`), `produtos:exportar` (`/produtos/exportar/`).
++- Form: `ImportarProdutosForm` (um campo de arquivo). Views: `ProdutoImportarView` (FormView), `ProdutoExportarView` (View GET).
++- Template novo: `produto_importar.html` (usa `form_corpo`, `campo` e `mensagens` existentes). Menu: dropdown Produtos → Lista / Importar Excel / Exportar Excel.
++
++## 10. Como testar localmente
++
++1. `pip install -r requirements.txt` (traz o `openpyxl`) e `python manage.py check`.
++2. `python manage.py test produtos` (precisa do PostgreSQL do `.env`; o Django cria e apaga um banco de teste).
++3. Manual: entre como Administrador → Produtos → **Exportar Excel** → abra, altere preço/estoque de uma linha, acrescente uma linha nova → **Importar Excel** → confira a mensagem, a lista, a tela de Estoque (movimentações "Importação Excel") e Logs.
++4. Planilha com erro (estoque negativo, código repetido, coluna faltando): deve mostrar a lista de erros e não gravar nada.
++5. Entre como Vendedor: o menu não mostra as opções e as URLs devolvem 403.
++
++## 11. Como testar em produção
++
++Checklist da seção 10 de `deploy/ORACLE_CLOUD.md`. Antes da primeira importação real, rode `./scripts/backup_db.sh` e importe primeiro uma planilha pequena.
++
++## 12. Segurança (verificado em `settings.py`)
++
++| Item | Situação | Ajuste |
++|---|---|---|
++| `DEBUG` | padrão `False`; o `.env` enviado tem `True` (desenvolvimento) | `False` em produção |
++| `ALLOWED_HOSTS` / CSRF | lidos do `.env`; `.env` enviado só tem localhost | colocar o domínio e `CSRF_TRUSTED_ORIGINS` com `https://` |
++| Sessão | 8 h, `HttpOnly`, `SameSite=Lax`, cookie seguro se não for DEBUG | manter |
++| HTTPS/HSTS/proxy | `SECURE_PROXY_SSL_HEADER`, SSL redirect e HSTS por `.env` | HSTS 3600 → 1 ano depois de validar |
++| Upload | não há `MEDIA`; planilha é lida em memória/temporário e descartada | 5 MB (form) + 6 MB (Caddy) + proteção contra zip bomb |
++| Permissões | importar/exportar só Administrador (view + teste) | — |
++| Admin | URL configurável (`DJANGO_ADMIN_URL`) | trocar o padrão |
++
++**Atenção ao `.env` dentro do zip:** o arquivo foi enviado junto com o projeto. Não li nem repeti os valores, mas por ele ter circulado, recomendo gerar uma nova `DJANGO_SECRET_KEY` e uma nova senha de banco para produção (a nuvem terá as suas de qualquer forma) e nunca versionar o `.env` (já está no `.gitignore`).
++
++## 13. Riscos
++
++- **Os testes Django novos não foram executados.** O ambiente de análise não tinha Django nem rede para instalá-lo. O que foi realmente executado: compilação de todos os arquivos alterados e testes do `excel.py` (leitura, erros, ida e volta, proteção contra fórmula, 20.000 linhas, limites). `registrar_lote`, form e views foram revisados contra o código existente, mas rode `python manage.py test produtos` antes de confiar.
++- **Código de barras não é único no banco:** se o cadastro tiver códigos repetidos, a importação recusa as linhas afetadas e pede correção (comportamento intencional e seguro).
++- **Importação por AJUSTE sobrescreve o saldo** com o valor da planilha. Se houver vendas entre exportar e importar, o saldo volta ao valor antigo. Oriente: importe logo após exportar, ou use a importação como "contagem de estoque".
++- Preços/estoque com formato de texto incomum (ex.: "1,5 mil") são recusados com mensagem, não adivinhados.
++- Oracle: recuperação de instância ociosa, falta de capacidade A1 e limite de 2 OCPU/12 GB (detalhes no runbook).
++- Operação síncrona: 20.000 linhas ficam bem abaixo do `timeout` de 60 s do Gunicorn, mas arquivos muito maiores precisariam de fila (não recomendado agora).
++
++## 14. Melhorias futuras (em ordem de valor)
++
++1. Tornar `codigo_barras` único no banco (índice único parcial para não vazios) depois de limpar duplicidades.
++2. Pré-visualização ("vai criar X, atualizar Y") com confirmação antes de gravar.
++3. Botão "Baixar modelo vazio" e coluna `Ação` (ex.: ENTRADA em vez de AJUSTE).
++4. Exportar respeitando os filtros da lista; exportar movimentações e vendas.
++5. Monitoramento externo gratuito (UptimeRobot) e alerta de falha de backup por e-mail.
++6. CI simples (GitHub Actions) rodando `manage.py test` a cada commit.
+diff -ruN -x __pycache__ -x .env -x var a/deploy/ORACLE_CLOUD.md b/deploy/ORACLE_CLOUD.md
+--- a/deploy/ORACLE_CLOUD.md	1969-12-31 21:00:00.000000000 -0300
++++ b/deploy/ORACLE_CLOUD.md	2026-11-11 20:26:42.767474056 -0300
+@@ -0,0 +1,152 @@
++# Pet Shop ERP na Oracle Cloud Always Free
++
++Arquitetura (a mesma que você pediu; só o proxy é o Caddy, que já está no projeto):
++
++```
++Internet → Caddy (80/443, SSL automático) → Gunicorn (127.0.0.1:8000) → Django → PostgreSQL (localhost)
++```
++
++Tudo roda em **uma única VM**. O PostgreSQL só escuta em `localhost`; nada além de 22, 80 e 443 fica aberto.
++
++## 1. Limites reais da camada gratuita
++
++Conferidos na documentação oficial da Oracle em nov/2026
++(<https://docs.oracle.com/en-us/iaas/Content/FreeTier/resourceref.htm>):
++
++| Recurso | Limite Always Free |
++|---|---|
++| Ampere A1 (ARM) | **2 OCPU e 12 GB no total** (1.500 OCPU-h e 9.000 GB-h por mês). Atenção: ainda circula a informação antiga de "4 OCPU / 24 GB"; não vale mais. |
++| AMD Micro | até 2 VMs de 1/8 OCPU e 1 GB |
++| Disco (boot + block) | 200 GB no total; máx. 5 backups de volume |
++| Saída de dados | 10 TB/mês |
++| Instância ociosa | **pode ser recuperada** se, por 7 dias, CPU (p95) < 20 %, rede < 20 % e (só A1) memória < 20 % |
++
++Outros pontos que você deve saber:
++
++- A criação da conta pede cartão de crédito (verificação). Dentro dos limites acima o custo é zero.
++- Passar do limite pode gerar cobrança: crie um **orçamento com alerta** (Billing → Budgets, valor baixo, ex.: US$ 1).
++- É comum aparecer "Out of host capacity" ao criar a VM A1. Tente outro horário/domínio de disponibilidade. Plano B: VM AMD Micro (1 GB) com 2 workers do Gunicorn e 2 GB de swap, bem mais apertada.
++- O risco de **recuperação por ociosidade** é real num sistema pequeno. Não consegui confirmar na documentação se converter a conta para *Pay As You Go* (continuando só dentro dos limites gratuitos) elimina esse risco; confira com a Oracle antes de depender disso. O que protege de verdade é ter **backup fora da VM** (seção 8).
++
++## 2. Tamanho da VM e sistema
++
++- Shape **VM.Standard.A1.Flex, 1 OCPU, 6 GB**, boot volume 50 GB. Sobra metade da cota para uma segunda VM de teste, e o ERP (Django + PostgreSQL + Caddy) usa pouco.
++- **Ubuntu 24.04 LTS (aarch64)**: Python 3.12 e PostgreSQL 16 nos repositórios oficiais. Todas as dependências do projeto têm versão para ARM (`psycopg[binary]`, `gunicorn`, `whitenoise`; `openpyxl` é Python puro).
++- Domínio: o SSL do Caddy exige um nome. Opções de custo zero: subdomínio grátis do DuckDNS. Com domínio próprio (.com.br, em torno de R$ 40/ano, confirme no Registro.br) o endereço fica mais profissional.
++
++## 3. Rede e firewall (os dois lugares!)
++
++1. **Console Oracle** (VCN → Security List da subnet pública): entrada TCP **22** (de preferência só do seu IP), **80** e **443** (0.0.0.0/0).
++2. **Dentro da VM** (as imagens Ubuntu da Oracle vêm com regras `iptables` que bloqueiam 80/443):
++
++```bash
++sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80  -j ACCEPT
++sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
++sudo netfilter-persistent save
++```
++
++Não habilite o `ufw` junto; use um ou outro. SSH somente com chave (padrão da Oracle). Não abra a porta 5432 nem a 8000.
++
++## 4. Pacotes, PostgreSQL e código
++
++```bash
++sudo apt update && sudo apt -y upgrade
++sudo apt -y install python3-venv python3-dev git postgresql postgresql-client unattended-upgrades
++
++# banco (troque a senha; ela vai para o .env)
++sudo -u postgres psql -c "CREATE USER petshop_user WITH PASSWORD 'TROQUE_ESTA_SENHA';"
++sudo -u postgres psql -c "CREATE DATABASE petshop_db OWNER petshop_user ENCODING 'UTF8';"
++
++# código (git clone, ou envie a pasta com scp/rsync)
++cd ~ && git clone SEU_REPOSITORIO petshop && cd petshop
++```
++
++Ajuste fino opcional em `/etc/postgresql/16/main/conf.d/petshop.conf` (reinicie o serviço depois):
++`shared_buffers = 512MB`, `effective_cache_size = 2GB`, `max_connections = 30`.
++
++## 5. Configuração do Django (`.env`)
++
++```bash
++cp deploy/env.producao.exemplo .env && chmod 600 .env
++python3 -c "import secrets; print(secrets.token_urlsafe(60))"   # use como DJANGO_SECRET_KEY
++```
++
++Edite no `.env`: `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS` e `DJANGO_CSRF_TRUSTED_ORIGINS` (com `https://` e o seu domínio), `DJANGO_ADMIN_URL`, `DB_PASSWORD`, e **`CLIENT_IP_HEADER=HTTP_X_FORWARDED_FOR`** (o Caddy preenche esse cabeçalho; o log de auditoria e o bloqueio de login errado dependem do IP correto). Comece com `DJANGO_HSTS_SECONDS=3600` e só suba para 1 ano depois de tudo funcionando.
++
++## 6. Instalar e subir
++
++```bash
++chmod +x deploy/*.sh scripts/*.sh
++./deploy/atualizar.sh            # venv, pip, backup, check --deploy, migrate, collectstatic, grupos
++.venv/bin/python manage.py createsuperuser
++./deploy/instalar_servico.sh     # Gunicorn como serviço systemd (inicia com a VM e reinicia se cair)
++```
++
++O `atualizar.sh` é também o comando de **todas as futuras atualizações** (`git pull` + migrations + reinício).
++
++## 7. Caddy (proxy + SSL)
++
++```bash
++sudo apt -y install debian-keyring debian-archive-keyring apt-transport-https curl gnupg
++curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
++curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
++sudo apt update && sudo apt -y install caddy
++```
++
++`/etc/caddy/Caddyfile` (aponte antes o DNS do domínio, registro A, para o IP público da VM):
++
++```
++petshop.seudominio.com {
++    encode zstd gzip
++    request_body {
++        max_size 6MB
++    }
++    reverse_proxy 127.0.0.1:8000
++}
++```
++
++`sudo systemctl reload caddy`. O certificado Let's Encrypt é emitido e renovado sozinho. O limite de 6 MB cobre o upload de planilha (o sistema já limita a 5 MB).
++
++**Se preferir Nginx:** `sudo apt install nginx certbot python3-certbot-nginx`, um `server` com `client_max_body_size 6m;`, `proxy_pass http://127.0.0.1:8000;` e os cabeçalhos `Host`, `X-Forwarded-For $remote_addr` e `X-Forwarded-Proto $scheme`; depois `sudo certbot --nginx -d seu.dominio` e `CLIENT_IP_HEADER=HTTP_X_FORWARDED_FOR`. Funciona igual, com mais passos manuais.
++
++## 8. Backups (não pule)
++
++Os scripts do projeto já fazem `pg_dump` diário às 02:30, com retenção de 35 dias:
++
++```bash
++./scripts/instalar_backup_agendado.sh
++./scripts/backup_db.sh --status
++```
++
++Mas uma cópia **na mesma VM** some junto com ela (inclusive em caso de recuperação por ociosidade). Envie para fora, por exemplo com `rclone` (Oracle Object Storage, Google Drive ou Backblaze B2 — confira a cota gratuita de cada um) em uma linha de cron às 03:30:
++
++```
++30 3 * * * rclone copy ~/petshop/var/backups REMOTO:petshop-backups --max-age 48h
++```
++
++Faça também, uma vez por semana, `scp` de um `.dump` para o seu computador, guarde uma cópia do `.env` em lugar seguro (ele não entra no backup) e **teste a restauração** com `scripts/testar_restauracao.sh` (guia em `scripts/backup_restauracao.md`). Os 5 backups de volume gratuitos da Oracle são um bônus, não o plano principal.
++
++## 9. Levar os dados atuais para a nuvem
++
++No seu computador: `pg_dump -Fc --no-owner -f petshop.dump petshop_db`. Envie com `scp`. Na VM:
++`pg_restore --no-owner --role=petshop_user -d petshop_db petshop.dump`.
++Atenção: a versão do PostgreSQL do seu computador não pode ser maior que a da VM (16). Depois rode `./deploy/atualizar.sh`.
++
++## 10. O que testar depois de subir
++
++1. `https://seu.dominio` abre com cadeado e redireciona o `http://`.
++2. Login funciona; erro de senha 5 vezes bloqueia (tela 429) e aparece em Logs com o **IP real**.
++3. Vendedor não vê "Importar/Exportar" e recebe 403 se digitar a URL.
++4. Exportar Excel baixa a planilha; importar de volta resulta em "sem alteração".
++5. `sudo reboot` e confirme que o sistema volta sozinho (`systemctl is-active petshop caddy postgresql`).
++6. `./scripts/backup_db.sh --status` sem alerta e a cópia externa chegou ao destino.
++7. `journalctl -u petshop -f` para acompanhar erros; `var/log/petshop.log` guarda o log da aplicação.
++
++## 11. Custos
++
++| Item | Custo |
++|---|---|
++| VM A1 1 OCPU/6 GB, 50 GB de disco, 10 TB de saída | R$ 0 (dentro do Always Free) |
++| SSL (Let's Encrypt via Caddy) | R$ 0 |
++| Domínio | R$ 0 (DuckDNS) ou ~R$ 40/ano |
++| Backup externo | R$ 0 dentro das cotas gratuitas do destino escolhido |
+diff -ruN -x __pycache__ -x .env -x var a/estoque/models.py b/estoque/models.py
+--- a/estoque/models.py	2026-11-05 18:07:41.000000000 -0300
++++ b/estoque/models.py	2026-11-11 20:24:32.578181206 -0300
+@@ -1,152 +1,237 @@
+-from django.conf import settings
+-from django.core.exceptions import ValidationError
+-from django.db import models, transaction
+-from django.db.models import F, Q
+-
+-from core.models import ModeloImutavel
+-from produtos.models import Produto
+-
+-
+-class MovimentacaoEstoque(ModeloImutavel):
+-    class Tipo(models.TextChoices):
+-        ENTRADA = "ENTRADA", "Entrada"
+-        SAIDA = "SAIDA", "Saída"
+-        AJUSTE = "AJUSTE", "Ajuste"
+-        VENDA = "VENDA", "Venda"
+-
+-    produto = models.ForeignKey(
+-        Produto,
+-        on_delete=models.PROTECT,
+-        related_name="movimentacoes",
+-        verbose_name="produto",
+-    )
+-    tipo = models.CharField("tipo", max_length=10, choices=Tipo.choices)
+-    quantidade = models.PositiveIntegerField(
+-        "quantidade",
+-        help_text=(
+-            "Unidades movimentadas. No AJUSTE, é o novo estoque contado."
+-        ),
+-    )
+-    usuario = models.ForeignKey(
+-        settings.AUTH_USER_MODEL,
+-        on_delete=models.PROTECT,
+-        related_name="movimentacoes_estoque",
+-        verbose_name="usuário responsável",
+-    )
+-    data = models.DateTimeField("data", auto_now_add=True)
+-    observacao = models.TextField("observação", blank=True, default="")
+-    quantidade_anterior = models.PositiveIntegerField("quantidade anterior")
+-    quantidade_nova = models.PositiveIntegerField("quantidade nova")
+-
+-    class Meta:
+-        verbose_name = "movimentação de estoque"
+-        verbose_name_plural = "movimentações de estoque"
+-        ordering = ["-data", "-id"]
+-        indexes = [
+-            models.Index(
+-                fields=["produto", "-data"], name="mov_estoque_produto_data_idx"
+-            ),
+-            models.Index(fields=["-data"], name="mov_estoque_data_idx"),
+-            models.Index(fields=["tipo"], name="mov_estoque_tipo_idx"),
+-        ]
+-        constraints = [
+-            models.CheckConstraint(
+-                condition=Q(tipo="AJUSTE") | Q(quantidade__gt=0),
+-                name="mov_estoque_quantidade_positiva",
+-            ),
+-            models.CheckConstraint(
+-                condition=(
+-                    Q(
+-                        tipo="ENTRADA",
+-                        quantidade_nova=F("quantidade_anterior") + F("quantidade"),
+-                    )
+-                    | Q(
+-                        tipo__in=["SAIDA", "VENDA"],
+-                        quantidade_nova=F("quantidade_anterior") - F("quantidade"),
+-                    )
+-                    | Q(tipo="AJUSTE", quantidade_nova=F("quantidade"))
+-                ),
+-                name="mov_estoque_saldo_consistente",
+-            ),
+-        ]
+-
+-    def __str__(self):
+-        return (
+-            f"{self.get_tipo_display()} de {self.quantidade} "
+-            f"- {self.produto} ({self.quantidade_anterior} → {self.quantidade_nova})"
+-        )
+-
+-    @property
+-    def variacao(self):
+-        return self.quantidade_nova - self.quantidade_anterior
+-
+-    @classmethod
+-    @transaction.atomic
+-    def registrar(cls, *, produto, tipo, quantidade, usuario, observacao=""):
+-        """
+-        ÚNICO caminho permitido para alterar o estoque de um produto.
+-
+-        - ENTRADA: soma `quantidade` ao estoque.
+-        - SAIDA / VENDA: subtrai `quantidade` (erro se faltar estoque).
+-        - AJUSTE: define o estoque como `quantidade` (contagem).
+-
+-        Bloqueia a linha do produto durante a operação para evitar
+-        corrida entre vendedores simultâneos.
+-        """
+-        if tipo not in cls.Tipo.values:
+-            raise ValidationError("Tipo de movimentação inválido.", code="tipo_invalido")
+-
+-        if usuario is None or not getattr(usuario, "pk", None):
+-            raise ValidationError(
+-                "É obrigatório informar o usuário responsável pela movimentação.",
+-                code="usuario_obrigatorio",
+-            )
+-
+-        try:
+-            quantidade = int(quantidade)
+-        except (TypeError, ValueError):
+-            raise ValidationError("Quantidade inválida.", code="quantidade_invalida")
+-
+-        if quantidade < 0 or (tipo != cls.Tipo.AJUSTE and quantidade == 0):
+-            raise ValidationError(
+-                "A quantidade deve ser maior que zero.", code="quantidade_invalida"
+-            )
+-
+-        bloqueado = Produto.objects.select_for_update().get(pk=produto.pk)
+-        anterior = bloqueado.quantidade or 0
+-
+-        if tipo == cls.Tipo.ENTRADA:
+-            nova = anterior + quantidade
+-        elif tipo in (cls.Tipo.SAIDA, cls.Tipo.VENDA):
+-            if quantidade > anterior:
+-                raise ValidationError(
+-                    f"Estoque insuficiente para '{bloqueado}': "
+-                    f"disponível {anterior}, solicitado {quantidade}.",
+-                    code="estoque_insuficiente",
+-                )
+-            nova = anterior - quantidade
+-        else:
+-            nova = quantidade
+-
+-        bloqueado._estoque_liberado = True
+-        try:
+-            bloqueado.quantidade = nova
+-            bloqueado.save(update_fields=["quantidade", "atualizado_em"])
+-        finally:
+-            bloqueado._estoque_liberado = False
+-
+-        movimentacao = cls.objects.create(
+-            produto=bloqueado,
+-            tipo=tipo,
+-            quantidade=quantidade,
+-            usuario=usuario,
+-            observacao=observacao or "",
+-            quantidade_anterior=anterior,
+-            quantidade_nova=nova,
+-        )
+-
+-        # Reflete o novo estoque no objeto recebido pelo chamador.
+-        produto.quantidade = nova
+-        produto._quantidade_original = nova
+-
+-        return movimentacao
+\ No newline at end of file
++from django.conf import settings
++from django.core.exceptions import ValidationError
++from django.db import models, transaction
++from django.db.models import F, Q
++from django.utils import timezone
++
++from core.models import ModeloImutavel
++from produtos.models import Produto
++
++
++class MovimentacaoEstoque(ModeloImutavel):
++    class Tipo(models.TextChoices):
++        ENTRADA = "ENTRADA", "Entrada"
++        SAIDA = "SAIDA", "Saída"
++        AJUSTE = "AJUSTE", "Ajuste"
++        VENDA = "VENDA", "Venda"
++
++    produto = models.ForeignKey(
++        Produto,
++        on_delete=models.PROTECT,
++        related_name="movimentacoes",
++        verbose_name="produto",
++    )
++    tipo = models.CharField("tipo", max_length=10, choices=Tipo.choices)
++    quantidade = models.PositiveIntegerField(
++        "quantidade",
++        help_text=(
++            "Unidades movimentadas. No AJUSTE, é o novo estoque contado."
++        ),
++    )
++    usuario = models.ForeignKey(
++        settings.AUTH_USER_MODEL,
++        on_delete=models.PROTECT,
++        related_name="movimentacoes_estoque",
++        verbose_name="usuário responsável",
++    )
++    data = models.DateTimeField("data", auto_now_add=True)
++    observacao = models.TextField("observação", blank=True, default="")
++    quantidade_anterior = models.PositiveIntegerField("quantidade anterior")
++    quantidade_nova = models.PositiveIntegerField("quantidade nova")
++
++    class Meta:
++        verbose_name = "movimentação de estoque"
++        verbose_name_plural = "movimentações de estoque"
++        ordering = ["-data", "-id"]
++        indexes = [
++            models.Index(
++                fields=["produto", "-data"], name="mov_estoque_produto_data_idx"
++            ),
++            models.Index(fields=["-data"], name="mov_estoque_data_idx"),
++            models.Index(fields=["tipo"], name="mov_estoque_tipo_idx"),
++        ]
++        constraints = [
++            models.CheckConstraint(
++                condition=Q(tipo="AJUSTE") | Q(quantidade__gt=0),
++                name="mov_estoque_quantidade_positiva",
++            ),
++            models.CheckConstraint(
++                condition=(
++                    Q(
++                        tipo="ENTRADA",
++                        quantidade_nova=F("quantidade_anterior") + F("quantidade"),
++                    )
++                    | Q(
++                        tipo__in=["SAIDA", "VENDA"],
++                        quantidade_nova=F("quantidade_anterior") - F("quantidade"),
++                    )
++                    | Q(tipo="AJUSTE", quantidade_nova=F("quantidade"))
++                ),
++                name="mov_estoque_saldo_consistente",
++            ),
++        ]
++
++    def __str__(self):
++        return (
++            f"{self.get_tipo_display()} de {self.quantidade} "
++            f"- {self.produto} ({self.quantidade_anterior} → {self.quantidade_nova})"
++        )
++
++    @property
++    def variacao(self):
++        return self.quantidade_nova - self.quantidade_anterior
++
++    @classmethod
++    @transaction.atomic
++    def registrar(cls, *, produto, tipo, quantidade, usuario, observacao=""):
++        """
++        ÚNICO caminho permitido para alterar o estoque de um produto.
++
++        - ENTRADA: soma `quantidade` ao estoque.
++        - SAIDA / VENDA: subtrai `quantidade` (erro se faltar estoque).
++        - AJUSTE: define o estoque como `quantidade` (contagem).
++
++        Bloqueia a linha do produto durante a operação para evitar
++        corrida entre vendedores simultâneos.
++        """
++        if tipo not in cls.Tipo.values:
++            raise ValidationError("Tipo de movimentação inválido.", code="tipo_invalido")
++
++        if usuario is None or not getattr(usuario, "pk", None):
++            raise ValidationError(
++                "É obrigatório informar o usuário responsável pela movimentação.",
++                code="usuario_obrigatorio",
++            )
++
++        try:
++            quantidade = int(quantidade)
++        except (TypeError, ValueError):
++            raise ValidationError("Quantidade inválida.", code="quantidade_invalida")
++
++        if quantidade < 0 or (tipo != cls.Tipo.AJUSTE and quantidade == 0):
++            raise ValidationError(
++                "A quantidade deve ser maior que zero.", code="quantidade_invalida"
++            )
++
++        bloqueado = Produto.objects.select_for_update().get(pk=produto.pk)
++        anterior = bloqueado.quantidade or 0
++
++        if tipo == cls.Tipo.ENTRADA:
++            nova = anterior + quantidade
++        elif tipo in (cls.Tipo.SAIDA, cls.Tipo.VENDA):
++            if quantidade > anterior:
++                raise ValidationError(
++                    f"Estoque insuficiente para '{bloqueado}': "
++                    f"disponível {anterior}, solicitado {quantidade}.",
++                    code="estoque_insuficiente",
++                )
++            nova = anterior - quantidade
++        else:
++            nova = quantidade
++
++        bloqueado._estoque_liberado = True
++        try:
++            bloqueado.quantidade = nova
++            bloqueado.save(update_fields=["quantidade", "atualizado_em"])
++        finally:
++            bloqueado._estoque_liberado = False
++
++        movimentacao = cls.objects.create(
++            produto=bloqueado,
++            tipo=tipo,
++            quantidade=quantidade,
++            usuario=usuario,
++            observacao=observacao or "",
++            quantidade_anterior=anterior,
++            quantidade_nova=nova,
++        )
++
++        # Reflete o novo estoque no objeto recebido pelo chamador.
++        produto.quantidade = nova
++        produto._quantidade_original = nova
++
++        return movimentacao
++
++    @classmethod
++    @transaction.atomic
++    def registrar_lote(cls, *, movimentos, usuario, observacao=""):
++        """
++        Versão em lote de registrar(), para importações grandes.
++
++        `movimentos` é uma lista de (produto_pk, tipo, quantidade), no máximo
++        um por produto, com tipo ENTRADA (soma) ou AJUSTE (define o estoque).
++        As mesmas regras de registrar() valem: as linhas dos produtos são
++        bloqueadas, o saldo é conferido pelo banco (constraints) e cada
++        movimento deixa seu histórico. Usa poucas consultas (bulk_create e
++        bulk_update) em vez de uma por produto.
++
++        Retorna a quantidade de movimentações gravadas.
++        """
++        if not movimentos:
++            return 0
++
++        if usuario is None or not getattr(usuario, "pk", None):
++            raise ValidationError(
++                "É obrigatório informar o usuário responsável pela movimentação.",
++                code="usuario_obrigatorio",
++            )
++
++        pks = [pk for pk, _, _ in movimentos]
++        if len(set(pks)) != len(pks):
++            raise ValidationError(
++                "Há mais de uma movimentação para o mesmo produto.",
++                code="produto_repetido",
++            )
++        for _, tipo, quantidade in movimentos:
++            if tipo not in (cls.Tipo.ENTRADA, cls.Tipo.AJUSTE):
++                raise ValidationError(
++                    "Tipo de movimentação inválido para lote.", code="tipo_invalido"
++                )
++            if quantidade < 0 or (tipo == cls.Tipo.ENTRADA and quantidade == 0):
++                raise ValidationError(
++                    "Quantidade inválida.", code="quantidade_invalida"
++                )
++
++        # Bloqueio em ordem de pk (evita deadlock) e em partes (limite de
++        # parâmetros da consulta).
++        produtos = {}
++        ordenados = sorted(pks)
++        for inicio in range(0, len(ordenados), 2000):
++            consulta = (
++                Produto.objects.select_for_update()
++                .filter(pk__in=ordenados[inicio : inicio + 2000])
++                .order_by("pk")
++            )
++            for produto in consulta:
++                produtos[produto.pk] = produto
++        if len(produtos) != len(pks):
++            raise ValidationError("Produto não encontrado.", code="produto_inexistente")
++
++        agora = timezone.now()
++        historico, alterados = [], []
++        for pk, tipo, quantidade in movimentos:
++            produto = produtos[pk]
++            anterior = produto.quantidade or 0
++            nova = anterior + quantidade if tipo == cls.Tipo.ENTRADA else quantidade
++            historico.append(
++                cls(
++                    produto_id=pk,
++                    tipo=tipo,
++                    quantidade=quantidade,
++                    usuario=usuario,
++                    observacao=observacao or "",
++                    quantidade_anterior=anterior,
++                    quantidade_nova=nova,
++                )
++            )
++            produto.quantidade = nova
++            produto.atualizado_em = agora
++            alterados.append(produto)
++
++        cls.objects.bulk_create(historico, batch_size=1000)
++        # bulk_update não passa por Produto.save(): é o caminho autorizado aqui,
++        # dentro desta transação e com as linhas bloqueadas.
++        Produto.objects.bulk_update(
++            alterados, ["quantidade", "atualizado_em"], batch_size=1000
++        )
++        return len(historico)
+diff -ruN -x __pycache__ -x .env -x var a/logs/migrations/0003_alter_logacao_acao.py b/logs/migrations/0003_alter_logacao_acao.py
+--- a/logs/migrations/0003_alter_logacao_acao.py	1969-12-31 21:00:00.000000000 -0300
++++ b/logs/migrations/0003_alter_logacao_acao.py	2026-11-11 15:10:37.352245466 -0300
+@@ -0,0 +1,16 @@
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        ('logs', '0002_alter_logacao_acao'),
++    ]
++
++    operations = [
++        migrations.AlterField(
++            model_name='logacao',
++            name='acao',
++            field=models.CharField(choices=[('CRIACAO', 'Criação'), ('EDICAO', 'Edição'), ('EXCLUSAO', 'Exclusão'), ('VENDA', 'Venda'), ('LOGIN', 'Login'), ('LOGOUT', 'Logout'), ('LOGIN_ERRO', 'Falha de login'), ('IMPORTACAO', 'Importação'), ('EXPORTACAO', 'Exportação')], max_length=10, verbose_name='ação'),
++        ),
++    ]
+diff -ruN -x __pycache__ -x .env -x var a/logs/models.py b/logs/models.py
+--- a/logs/models.py	2026-11-05 19:48:02.000000000 -0300
++++ b/logs/models.py	2026-11-11 20:23:55.004073452 -0300
+@@ -1,51 +1,53 @@
+-from django.conf import settings
+-from django.db import models
+-
+-from core.models import ModeloImutavel
+-
+-
+-class LogAcao(ModeloImutavel):
+-    class Acao(models.TextChoices):
+-        CRIACAO = "CRIACAO", "Criação"
+-        EDICAO = "EDICAO", "Edição"
+-        EXCLUSAO = "EXCLUSAO", "Exclusão"
+-        VENDA = "VENDA", "Venda"
+-        LOGIN = "LOGIN", "Login"
+-        LOGOUT = "LOGOUT", "Logout"
+-        LOGIN_ERRO = "LOGIN_ERRO", "Falha de login"
+-
+-    usuario = models.ForeignKey(
+-        settings.AUTH_USER_MODEL,
+-        on_delete=models.PROTECT,
+-        null=True,
+-        blank=True,
+-        related_name="logs_acao",
+-        verbose_name="usuário",
+-    )
+-    acao = models.CharField("ação", max_length=10, choices=Acao.choices)
+-    ip = models.GenericIPAddressField("IP", null=True, blank=True)
+-    data = models.DateTimeField("data", auto_now_add=True)
+-    descricao = models.TextField("descrição", blank=True, default="")
+-
+-    class Meta:
+-        verbose_name = "log de ação"
+-        verbose_name_plural = "logs de ações"
+-        ordering = ["-data", "-id"]
+-        indexes = [
+-            models.Index(fields=["-data"], name="logacao_data_idx"),
+-            models.Index(fields=["usuario", "-data"], name="logacao_usuario_data_idx"),
+-            models.Index(fields=["acao"], name="logacao_acao_idx"),
+-        ]
+-
+-    def __str__(self):
+-        nome = self.usuario.get_username() if self.usuario else "anônimo"
+-        return f"{self.data:%d/%m/%Y %H:%M} - {nome} - {self.get_acao_display()}"
+-
+-    @classmethod
+-    def registrar(cls, *, usuario, acao, ip=None, descricao=""):
+-        """Cria um registro de auditoria. Aceita usuário anônimo (vira None)."""
+-        if usuario is not None and not getattr(usuario, "is_authenticated", False):
+-            usuario = None
+-        return cls.objects.create(
+-            usuario=usuario, acao=acao, ip=ip or None, descricao=descricao or ""
++from django.conf import settings
++from django.db import models
++
++from core.models import ModeloImutavel
++
++
++class LogAcao(ModeloImutavel):
++    class Acao(models.TextChoices):
++        CRIACAO = "CRIACAO", "Criação"
++        EDICAO = "EDICAO", "Edição"
++        EXCLUSAO = "EXCLUSAO", "Exclusão"
++        VENDA = "VENDA", "Venda"
++        LOGIN = "LOGIN", "Login"
++        LOGOUT = "LOGOUT", "Logout"
++        LOGIN_ERRO = "LOGIN_ERRO", "Falha de login"
++        IMPORTACAO = "IMPORTACAO", "Importação"
++        EXPORTACAO = "EXPORTACAO", "Exportação"
++
++    usuario = models.ForeignKey(
++        settings.AUTH_USER_MODEL,
++        on_delete=models.PROTECT,
++        null=True,
++        blank=True,
++        related_name="logs_acao",
++        verbose_name="usuário",
++    )
++    acao = models.CharField("ação", max_length=10, choices=Acao.choices)
++    ip = models.GenericIPAddressField("IP", null=True, blank=True)
++    data = models.DateTimeField("data", auto_now_add=True)
++    descricao = models.TextField("descrição", blank=True, default="")
++
++    class Meta:
++        verbose_name = "log de ação"
++        verbose_name_plural = "logs de ações"
++        ordering = ["-data", "-id"]
++        indexes = [
++            models.Index(fields=["-data"], name="logacao_data_idx"),
++            models.Index(fields=["usuario", "-data"], name="logacao_usuario_data_idx"),
++            models.Index(fields=["acao"], name="logacao_acao_idx"),
++        ]
++
++    def __str__(self):
++        nome = self.usuario.get_username() if self.usuario else "anônimo"
++        return f"{self.data:%d/%m/%Y %H:%M} - {nome} - {self.get_acao_display()}"
++
++    @classmethod
++    def registrar(cls, *, usuario, acao, ip=None, descricao=""):
++        """Cria um registro de auditoria. Aceita usuário anônimo (vira None)."""
++        if usuario is not None and not getattr(usuario, "is_authenticated", False):
++            usuario = None
++        return cls.objects.create(
++            usuario=usuario, acao=acao, ip=ip or None, descricao=descricao or ""
+         )
+\ No newline at end of file
+diff -ruN -x __pycache__ -x .env -x var a/produtos/excel.py b/produtos/excel.py
+--- a/produtos/excel.py	1969-12-31 21:00:00.000000000 -0300
++++ b/produtos/excel.py	2026-11-11 15:09:43.697051253 -0300
+@@ -0,0 +1,327 @@
++"""
++Leitura, validação e geração de planilhas XLSX de produtos.
++
++Este módulo NÃO acessa o banco nem importa o Django: só trata a planilha.
++A gravação no banco fica em produtos/importacao.py.
++
++Usa apenas o openpyxl (a planilha é lida em modo somente leitura, linha a
++linha, para gastar pouca memória).
++"""
++
++import unicodedata
++from decimal import Decimal, InvalidOperation
++from io import BytesIO
++
++from openpyxl import Workbook, load_workbook
++from openpyxl.cell import WriteOnlyCell
++
++MAX_LINHAS = 20000
++MAX_ERROS = 100
++MAX_ESTOQUE = 2_147_483_647  # limite do PositiveIntegerField
++MAX_PRECO = Decimal("99999999.99")  # DecimalField(max_digits=10, decimal_places=2)
++CENTAVOS = Decimal("0.01")
++
++# Ordem e títulos das colunas da exportação (e modelo da importação).
++COLUNAS_EXPORTACAO = [
++    ("codigo", "Código de barras"),
++    ("nome", "Nome"),
++    ("categoria", "Categoria"),
++    ("fornecedor", "Fornecedor"),
++    ("estoque", "Estoque"),
++    ("estoque_minimo", "Estoque mínimo"),
++    ("preco_custo", "Preço de custo"),
++    ("preco_venda", "Preço de venda"),
++    ("ativo", "Ativo"),
++]
++
++# Nomes aceitos no cabeçalho (comparados sem acento, em minúsculas).
++ALIASES = {
++    "codigo": {"codigo de barras", "codigo", "cod barras", "ean"},
++    "nome": {"nome", "produto", "descricao"},
++    "categoria": {"categoria"},
++    "fornecedor": {"fornecedor"},
++    "estoque": {"estoque", "quantidade", "qtd"},
++    "estoque_minimo": {"estoque minimo", "minimo"},
++    "preco_custo": {"preco de custo", "custo", "preco custo"},
++    "preco_venda": {"preco de venda", "venda", "preco venda", "preco"},
++    "ativo": {"ativo", "situacao"},
++}
++OBRIGATORIAS = ("codigo", "nome", "estoque", "preco_venda")
++TITULO = dict(COLUNAS_EXPORTACAO)
++
++LIMITES_TEXTO = {"codigo": 50, "nome": 150, "categoria": 100, "fornecedor": 150}
++
++VERDADEIRO = {"sim", "s", "1", "true", "verdadeiro", "ativo", "x"}
++FALSO = {"nao", "n", "0", "false", "falso", "inativo"}
++
++
++class PlanilhaInvalida(Exception):
++    """Arquivo que não pôde ser lido como planilha XLSX."""
++
++
++def _normalizar(texto):
++    texto = unicodedata.normalize("NFKD", str(texto))
++    texto = "".join(c for c in texto if not unicodedata.combining(c))
++    return " ".join(texto.lower().split())
++
++
++def _vazio(valor):
++    return valor is None or (isinstance(valor, str) and not valor.strip())
++
++
++def _texto(valor):
++    """Texto limpo. Números inteiros viram '123', não '123.0'."""
++    if isinstance(valor, float) and valor.is_integer():
++        valor = int(valor)
++    return str(valor).strip()
++
++
++def _inteiro(valor):
++    """Inteiro >= 0 ou levanta ValueError com a mensagem para o usuário."""
++    if isinstance(valor, bool):
++        raise ValueError("deve ser um número inteiro")
++    if isinstance(valor, str):
++        bruto = valor.strip()
++        try:
++            numero = Decimal(bruto)
++        except InvalidOperation:
++            raise ValueError("deve ser um número inteiro") from None
++    else:
++        try:
++            numero = Decimal(str(valor))
++        except InvalidOperation:
++            raise ValueError("deve ser um número inteiro") from None
++    if not numero.is_finite() or numero != numero.to_integral_value():
++        raise ValueError("deve ser um número inteiro")
++    if numero < 0:
++        raise ValueError("não pode ser negativo")
++    if numero > MAX_ESTOQUE:
++        raise ValueError("valor muito grande")
++    return int(numero)
++
++
++def _preco(valor):
++    """Decimal >= 0 com até 2 casas, ou levanta ValueError."""
++    if isinstance(valor, bool):
++        raise ValueError("deve ser um valor numérico")
++    if isinstance(valor, str):
++        bruto = valor.upper().replace("R$", "").replace(" ", "").strip()
++        if "," in bruto:  # formato brasileiro: 1.234,56
++            bruto = bruto.replace(".", "").replace(",", ".")
++    else:
++        bruto = str(valor)
++    try:
++        numero = Decimal(bruto)
++    except InvalidOperation:
++        raise ValueError("deve ser um valor numérico") from None
++    if not numero.is_finite():
++        raise ValueError("deve ser um valor numérico")
++    if numero < 0:
++        raise ValueError("não pode ser negativo")
++    if numero != numero.quantize(CENTAVOS):
++        raise ValueError("use no máximo 2 casas decimais")
++    if numero > MAX_PRECO:
++        raise ValueError("valor muito grande")
++    return numero.quantize(CENTAVOS)
++
++
++def _booleano(valor):
++    if isinstance(valor, bool):
++        return valor
++    chave = _normalizar(valor)
++    if chave in VERDADEIRO:
++        return True
++    if chave in FALSO:
++        return False
++    raise ValueError("use Sim ou Não")
++
++
++def _mapear_cabecalho(cabecalho):
++    """Retorna ({campo: índice da coluna}, [erros])."""
++    mapa, erros = {}, []
++    for indice, titulo in enumerate(cabecalho):
++        if _vazio(titulo):
++            continue
++        chave = _normalizar(titulo)
++        for campo, nomes in ALIASES.items():
++            if chave in nomes:
++                if campo in mapa:
++                    erros.append(f"A coluna '{TITULO[campo]}' aparece mais de uma vez.")
++                else:
++                    mapa[campo] = indice
++                break
++    faltando = [TITULO[c] for c in OBRIGATORIAS if c not in mapa]
++    if faltando:
++        erros.append("Colunas obrigatórias ausentes: " + ", ".join(faltando) + ".")
++    return mapa, erros
++
++
++def ler_planilha(arquivo):
++    """
++    Lê e valida o XLSX enviado. `arquivo` é qualquer objeto de arquivo
++    (inclusive o UploadedFile do Django).
++
++    Retorna (linhas, erros):
++    - linhas: lista de dicionários prontos para gravar, cada um com a chave
++      "linha" (número da linha na planilha) e os campos do produto.
++      Campos opcionais em branco ficam como None.
++    - erros: lista de mensagens amigáveis. Se houver qualquer erro, nada
++      deve ser gravado.
++    """
++    try:
++        pasta = load_workbook(arquivo, read_only=True, data_only=True)
++    except Exception:
++        raise PlanilhaInvalida(
++            "Não foi possível ler o arquivo. Envie uma planilha Excel (.xlsx) válida."
++        ) from None
++
++    try:
++        if not pasta.worksheets:
++            raise PlanilhaInvalida("A planilha não tem nenhuma aba.")
++        try:
++            linhas_brutas = pasta.worksheets[0].iter_rows(values_only=True)
++            cabecalho = next(linhas_brutas, None)
++            if not cabecalho:
++                raise PlanilhaInvalida("A planilha está vazia.")
++
++            mapa, erros = _mapear_cabecalho(cabecalho)
++            if erros:
++                return [], erros
++
++            linhas, vistos = [], {}
++            total_erros = 0
++
++            def registrar_erro(texto):
++                nonlocal total_erros
++                total_erros += 1
++                if len(erros) < MAX_ERROS:
++                    erros.append(texto)
++
++            for numero, bruta in enumerate(linhas_brutas, start=2):
++                if all(_vazio(c) for c in bruta):
++                    continue
++                if len(linhas) + total_erros >= MAX_LINHAS:
++                    return [], [
++                        f"A planilha tem mais de {MAX_LINHAS} linhas. "
++                        "Divida em arquivos menores."
++                    ]
++
++                def celula(campo):
++                    indice = mapa.get(campo)
++                    if indice is None or indice >= len(bruta):
++                        return None
++                    return bruta[indice]
++
++                registro = {"linha": numero}
++                problemas = []
++
++                for campo in ("codigo", "nome", "categoria", "fornecedor"):
++                    valor = celula(campo)
++                    if _vazio(valor):
++                        registro[campo] = None
++                        if campo in OBRIGATORIAS:
++                            problemas.append(f"'{TITULO[campo]}' está vazio")
++                        continue
++                    texto = _texto(valor)
++                    if len(texto) > LIMITES_TEXTO[campo]:
++                        problemas.append(
++                            f"'{TITULO[campo]}' passa de {LIMITES_TEXTO[campo]} caracteres"
++                        )
++                    registro[campo] = texto
++
++                conversores = (
++                    ("estoque", _inteiro),
++                    ("estoque_minimo", _inteiro),
++                    ("preco_custo", _preco),
++                    ("preco_venda", _preco),
++                    ("ativo", _booleano),
++                )
++                for campo, converter in conversores:
++                    valor = celula(campo)
++                    if _vazio(valor):
++                        registro[campo] = None
++                        if campo in OBRIGATORIAS:
++                            problemas.append(f"'{TITULO[campo]}' está vazio")
++                        continue
++                    try:
++                        registro[campo] = converter(valor)
++                    except ValueError as erro:
++                        problemas.append(f"'{TITULO[campo]}' {erro} (valor: {valor!r})")
++
++                codigo = registro.get("codigo")
++                if codigo:
++                    if codigo in vistos:
++                        problemas.append(
++                            f"código de barras repetido (já usado na linha {vistos[codigo]})"
++                        )
++                    else:
++                        vistos[codigo] = numero
++
++                if problemas:
++                    registrar_erro(f"Linha {numero}: " + "; ".join(problemas) + ".")
++                else:
++                    linhas.append(registro)
++
++            if total_erros > len(erros):
++                erros.append(f"... e mais {total_erros - len(erros)} linha(s) com erro.")
++            if not linhas and not erros:
++                erros.append("A planilha não tem nenhum produto (só o cabeçalho).")
++            return linhas, erros
++        except PlanilhaInvalida:
++            raise
++        except Exception:
++            raise PlanilhaInvalida(
++                "O arquivo está corrompido ou fora do formato esperado."
++            ) from None
++    finally:
++        pasta.close()
++
++
++def gerar_xlsx(registros):
++    """
++    Gera o XLSX da exportação e devolve os bytes.
++
++    `registros` é um iterável de tuplas na ordem de COLUNAS_EXPORTACAO:
++    (codigo, nome, categoria, fornecedor, estoque, estoque_minimo,
++     preco_custo, preco_venda, ativo).
++
++    Usa o modo write_only do openpyxl (memória baixa) e grava textos sempre
++    como texto: evita que um nome começando com "=" seja executado como
++    fórmula no Excel e preserva zeros à esquerda do código de barras.
++    """
++    pasta = Workbook(write_only=True)
++    folha = pasta.create_sheet("Produtos")
++    folha.freeze_panes = "A2"
++    for letra, largura in zip("ABCDEFGHI", (20, 40, 22, 26, 10, 15, 16, 16, 8)):
++        folha.column_dimensions[letra].width = largura
++
++    folha.append([titulo for _, titulo in COLUNAS_EXPORTACAO])
++
++    def texto(valor):
++        celula = WriteOnlyCell(folha, value=valor or "")
++        celula.data_type = "s"
++        return celula
++
++    def dinheiro(valor):
++        celula = WriteOnlyCell(folha, value=valor)
++        celula.number_format = "#,##0.00"
++        return celula
++
++    for (codigo, nome, categoria, fornecedor, estoque, minimo, custo, venda, ativo) in registros:
++        folha.append(
++            [
++                texto(codigo),
++                texto(nome),
++                texto(categoria),
++                texto(fornecedor),
++                estoque or 0,
++                minimo,
++                dinheiro(custo),
++                dinheiro(venda),
++                "Sim" if ativo else "Não",
++            ]
++        )
++
++    saida = BytesIO()
++    pasta.save(saida)
++    return saida.getvalue()
+diff -ruN -x __pycache__ -x .env -x var a/produtos/forms.py b/produtos/forms.py
+--- a/produtos/forms.py	2026-11-05 18:27:37.000000000 -0300
++++ b/produtos/forms.py	2026-11-11 20:24:32.578506512 -0300
+@@ -1,169 +1,209 @@
+-from django import forms
+-from django.core.exceptions import ValidationError
+-from django.db import transaction
+-from django.db.models import Q
+-
+-from core.forms import BootstrapFormMixin
+-from estoque.models import MovimentacaoEstoque
+-
+-from .models import Produto
+-
+-
+-class ProdutoSelect(forms.Select):
+-    """
+-    Select de produtos que expõe dados úteis ao JavaScript da tela de venda
+-    (preço de venda, estoque e código de barras). O preço de custo nunca
+-    é exposto.
+-    """
+-
+-    def create_option(
+-        self, name, value, label, selected, index, subindex=None, attrs=None
+-    ):
+-        opcao = super().create_option(
+-            name, value, label, selected, index, subindex=subindex, attrs=attrs
+-        )
+-        produto = getattr(value, "instance", None)
+-        if produto is not None:
+-            preco = produto.preco_venda
+-            opcao["attrs"]["data-preco"] = f"{preco:.2f}" if preco is not None else ""
+-            opcao["attrs"]["data-estoque"] = str(produto.quantidade or 0)
+-            opcao["attrs"]["data-codigo"] = produto.codigo_barras or ""
+-        return opcao
+-
+-
+-class ProdutoChoiceField(forms.ModelChoiceField):
+-    """Seleção de produto. Por padrão lista apenas produtos ativos."""
+-
+-    widget = ProdutoSelect
+-
+-    def __init__(self, queryset=None, **kwargs):
+-        if queryset is None:
+-            queryset = Produto.objects.ativos().order_by("nome", "id")
+-        kwargs.setdefault("label", "Produto")
+-        kwargs.setdefault("empty_label", "Selecione um produto")
+-        super().__init__(queryset, **kwargs)
+-
+-    def label_from_instance(self, obj):
+-        texto = obj.nome or f"Produto #{obj.pk}"
+-        if obj.codigo_barras:
+-            texto += f" [{obj.codigo_barras}]"
+-        return f"{texto} (estoque: {obj.quantidade or 0})"
+-
+-
+-class ProdutoForm(BootstrapFormMixin, forms.ModelForm):
+-    quantidade_inicial = forms.IntegerField(
+-        label="Estoque inicial",
+-        min_value=0,
+-        required=False,
+-        initial=0,
+-        help_text="Gera automaticamente uma movimentação de ENTRADA.",
+-    )
+-
+-    class Meta:
+-        model = Produto
+-        fields = [
+-            "nome",
+-            "codigo_barras",
+-            "categoria",
+-            "fornecedor",
+-            "estoque_minimo",
+-            "preco_custo",
+-            "preco_venda",
+-            "ativo",
+-        ]
+-        widgets = {
+-            "nome": forms.TextInput(attrs={"autofocus": True}),
+-        }
+-
+-    def __init__(self, *args, usuario=None, **kwargs):
+-        self.usuario = usuario
+-        super().__init__(*args, **kwargs)
+-        self.criando = self.instance.pk is None
+-        if not self.criando:
+-            # O estoque de um produto existente só muda por movimentação.
+-            del self.fields["quantidade_inicial"]
+-
+-    def clean_codigo_barras(self):
+-        codigo = (self.cleaned_data.get("codigo_barras") or "").strip()
+-        if codigo:
+-            existente = (
+-                Produto.objects.filter(codigo_barras=codigo)
+-                .exclude(pk=self.instance.pk)
+-                .first()
+-            )
+-            if existente:
+-                raise ValidationError(
+-                    f"Já existe um produto com este código de barras: {existente}."
+-                )
+-        return codigo
+-
+-    def clean_quantidade_inicial(self):
+-        quantidade = self.cleaned_data.get("quantidade_inicial") or 0
+-        if quantidade > 0 and self.usuario is None:
+-            raise ValidationError(
+-                "Não foi possível identificar o usuário responsável pelo estoque."
+-            )
+-        return quantidade
+-
+-    @transaction.atomic
+-    def save(self, commit=True):
+-        produto = super().save(commit=commit)
+-        if commit and self.criando:
+-            quantidade = self.cleaned_data.get("quantidade_inicial") or 0
+-            if quantidade > 0:
+-                MovimentacaoEstoque.registrar(
+-                    produto=produto,
+-                    tipo=MovimentacaoEstoque.Tipo.ENTRADA,
+-                    quantidade=quantidade,
+-                    usuario=self.usuario,
+-                    observacao="Estoque inicial",
+-                )
+-        return produto
+-
+-
+-class ProdutoFiltroForm(BootstrapFormMixin, forms.Form):
+-    q = forms.CharField(
+-        label="Buscar",
+-        required=False,
+-        widget=forms.TextInput(
+-            attrs={"placeholder": "Nome ou código de barras"}
+-        ),
+-    )
+-    categoria = forms.CharField(label="Categoria", required=False)
+-    fornecedor = forms.CharField(label="Fornecedor", required=False)
+-    situacao = forms.ChoiceField(
+-        label="Situação",
+-        required=False,
+-        choices=[("", "Todos"), ("ativos", "Ativos"), ("inativos", "Inativos")],
+-    )
+-    estoque_baixo = forms.BooleanField(
+-        label="Somente estoque baixo", required=False
+-    )
+-
+-    def filtrar(self, queryset):
+-        if not self.is_valid():
+-            return queryset
+-
+-        dados = self.cleaned_data
+-
+-        termo = dados.get("q")
+-        if termo:
+-            queryset = queryset.filter(
+-                Q(nome__icontains=termo) | Q(codigo_barras__icontains=termo)
+-            )
+-
+-        if dados.get("categoria"):
+-            queryset = queryset.filter(categoria__icontains=dados["categoria"])
+-
+-        if dados.get("fornecedor"):
+-            queryset = queryset.filter(fornecedor__icontains=dados["fornecedor"])
+-
+-        if dados.get("situacao") == "ativos":
+-            queryset = queryset.filter(ativo=True)
+-        elif dados.get("situacao") == "inativos":
+-            queryset = queryset.filter(ativo=False)
+-
+-        if dados.get("estoque_baixo"):
+-            queryset = queryset.estoque_baixo()
+-
+-        return queryset
+\ No newline at end of file
++import zipfile
++
++from django import forms
++from django.core.exceptions import ValidationError
++from django.db import transaction
++from django.db.models import Q
++
++from core.forms import BootstrapFormMixin
++from estoque.models import MovimentacaoEstoque
++
++from .models import Produto
++
++
++class ProdutoSelect(forms.Select):
++    """
++    Select de produtos que expõe dados úteis ao JavaScript da tela de venda
++    (preço de venda, estoque e código de barras). O preço de custo nunca
++    é exposto.
++    """
++
++    def create_option(
++        self, name, value, label, selected, index, subindex=None, attrs=None
++    ):
++        opcao = super().create_option(
++            name, value, label, selected, index, subindex=subindex, attrs=attrs
++        )
++        produto = getattr(value, "instance", None)
++        if produto is not None:
++            preco = produto.preco_venda
++            opcao["attrs"]["data-preco"] = f"{preco:.2f}" if preco is not None else ""
++            opcao["attrs"]["data-estoque"] = str(produto.quantidade or 0)
++            opcao["attrs"]["data-codigo"] = produto.codigo_barras or ""
++        return opcao
++
++
++class ProdutoChoiceField(forms.ModelChoiceField):
++    """Seleção de produto. Por padrão lista apenas produtos ativos."""
++
++    widget = ProdutoSelect
++
++    def __init__(self, queryset=None, **kwargs):
++        if queryset is None:
++            queryset = Produto.objects.ativos().order_by("nome", "id")
++        kwargs.setdefault("label", "Produto")
++        kwargs.setdefault("empty_label", "Selecione um produto")
++        super().__init__(queryset, **kwargs)
++
++    def label_from_instance(self, obj):
++        texto = obj.nome or f"Produto #{obj.pk}"
++        if obj.codigo_barras:
++            texto += f" [{obj.codigo_barras}]"
++        return f"{texto} (estoque: {obj.quantidade or 0})"
++
++
++class ProdutoForm(BootstrapFormMixin, forms.ModelForm):
++    quantidade_inicial = forms.IntegerField(
++        label="Estoque inicial",
++        min_value=0,
++        required=False,
++        initial=0,
++        help_text="Gera automaticamente uma movimentação de ENTRADA.",
++    )
++
++    class Meta:
++        model = Produto
++        fields = [
++            "nome",
++            "codigo_barras",
++            "categoria",
++            "fornecedor",
++            "estoque_minimo",
++            "preco_custo",
++            "preco_venda",
++            "ativo",
++        ]
++        widgets = {
++            "nome": forms.TextInput(attrs={"autofocus": True}),
++        }
++
++    def __init__(self, *args, usuario=None, **kwargs):
++        self.usuario = usuario
++        super().__init__(*args, **kwargs)
++        self.criando = self.instance.pk is None
++        if not self.criando:
++            # O estoque de um produto existente só muda por movimentação.
++            del self.fields["quantidade_inicial"]
++
++    def clean_codigo_barras(self):
++        codigo = (self.cleaned_data.get("codigo_barras") or "").strip()
++        if codigo:
++            existente = (
++                Produto.objects.filter(codigo_barras=codigo)
++                .exclude(pk=self.instance.pk)
++                .first()
++            )
++            if existente:
++                raise ValidationError(
++                    f"Já existe um produto com este código de barras: {existente}."
++                )
++        return codigo
++
++    def clean_quantidade_inicial(self):
++        quantidade = self.cleaned_data.get("quantidade_inicial") or 0
++        if quantidade > 0 and self.usuario is None:
++            raise ValidationError(
++                "Não foi possível identificar o usuário responsável pelo estoque."
++            )
++        return quantidade
++
++    @transaction.atomic
++    def save(self, commit=True):
++        produto = super().save(commit=commit)
++        if commit and self.criando:
++            quantidade = self.cleaned_data.get("quantidade_inicial") or 0
++            if quantidade > 0:
++                MovimentacaoEstoque.registrar(
++                    produto=produto,
++                    tipo=MovimentacaoEstoque.Tipo.ENTRADA,
++                    quantidade=quantidade,
++                    usuario=self.usuario,
++                    observacao="Estoque inicial",
++                )
++        return produto
++
++
++class ProdutoFiltroForm(BootstrapFormMixin, forms.Form):
++    q = forms.CharField(
++        label="Buscar",
++        required=False,
++        widget=forms.TextInput(
++            attrs={"placeholder": "Nome ou código de barras"}
++        ),
++    )
++    categoria = forms.CharField(label="Categoria", required=False)
++    fornecedor = forms.CharField(label="Fornecedor", required=False)
++    situacao = forms.ChoiceField(
++        label="Situação",
++        required=False,
++        choices=[("", "Todos"), ("ativos", "Ativos"), ("inativos", "Inativos")],
++    )
++    estoque_baixo = forms.BooleanField(
++        label="Somente estoque baixo", required=False
++    )
++
++    def filtrar(self, queryset):
++        if not self.is_valid():
++            return queryset
++
++        dados = self.cleaned_data
++
++        termo = dados.get("q")
++        if termo:
++            queryset = queryset.filter(
++                Q(nome__icontains=termo) | Q(codigo_barras__icontains=termo)
++            )
++
++        if dados.get("categoria"):
++            queryset = queryset.filter(categoria__icontains=dados["categoria"])
++
++        if dados.get("fornecedor"):
++            queryset = queryset.filter(fornecedor__icontains=dados["fornecedor"])
++
++        if dados.get("situacao") == "ativos":
++            queryset = queryset.filter(ativo=True)
++        elif dados.get("situacao") == "inativos":
++            queryset = queryset.filter(ativo=False)
++
++        if dados.get("estoque_baixo"):
++            queryset = queryset.estoque_baixo()
++
++        return queryset
++
++
++class ImportarProdutosForm(BootstrapFormMixin, forms.Form):
++    """Upload da planilha. A leitura e a validação das linhas ficam em excel.py."""
++
++    TAMANHO_MAXIMO = 5 * 1024 * 1024  # 5 MB
++    DESCOMPACTADO_MAXIMO = 100 * 1024 * 1024  # protege contra "zip bomb"
++
++    arquivo = forms.FileField(
++        label="Planilha Excel (.xlsx)",
++        widget=forms.FileInput(attrs={"accept": ".xlsx"}),
++        help_text="Arquivo .xlsx de até 5 MB. A primeira aba é a lida.",
++    )
++
++    def clean_arquivo(self):
++        arquivo = self.cleaned_data["arquivo"]
++
++        if not arquivo.name.lower().endswith(".xlsx"):
++            raise ValidationError("Envie um arquivo no formato .xlsx.")
++        if arquivo.size > self.TAMANHO_MAXIMO:
++            raise ValidationError("O arquivo passa de 5 MB. Divida em arquivos menores.")
++
++        try:
++            with zipfile.ZipFile(arquivo) as pacote:
++                nomes = pacote.namelist()
++                descompactado = sum(item.file_size for item in pacote.infolist())
++        except zipfile.BadZipFile:
++            raise ValidationError(
++                "O arquivo não é uma planilha .xlsx válida."
++            ) from None
++        finally:
++            arquivo.seek(0)
++
++        if "xl/workbook.xml" not in nomes:
++            raise ValidationError("O arquivo não é uma planilha .xlsx válida.")
++        if descompactado > self.DESCOMPACTADO_MAXIMO:
++            raise ValidationError("A planilha é grande demais para ser importada.")
++        return arquivo
+diff -ruN -x __pycache__ -x .env -x var a/produtos/importacao.py b/produtos/importacao.py
+--- a/produtos/importacao.py	1969-12-31 21:00:00.000000000 -0300
++++ b/produtos/importacao.py	2026-11-11 15:10:37.350724524 -0300
+@@ -0,0 +1,143 @@
++"""
++Gravação da importação de produtos no banco (as linhas já vêm validadas
++por produtos/excel.py).
++
++Regras:
++- A chave de ligação é o código de barras.
++- Produto existente: atualiza preço de venda, preço de custo (se informado)
++  e estoque. Nome, categoria, fornecedor, estoque mínimo e situação são
++  preservados.
++- Produto novo: é criado com todos os campos da planilha.
++- Estoque: sempre por MovimentacaoEstoque (a regra do projeto). Produto
++  existente recebe um AJUSTE para o valor da planilha (contagem); produto
++  novo recebe uma ENTRADA com o estoque inicial.
++"""
++
++from collections import defaultdict
++from dataclasses import dataclass
++
++from django.db import transaction
++from django.utils import timezone
++
++from estoque.models import MovimentacaoEstoque
++
++from .models import Produto
++
++LOTE_CONSULTA = 2000
++OBSERVACAO = "Importação Excel"
++
++
++class ImportacaoInvalida(Exception):
++    """Problema encontrado ao confrontar a planilha com o cadastro."""
++
++    def __init__(self, erros):
++        super().__init__("; ".join(erros))
++        self.erros = erros
++
++
++@dataclass
++class ResultadoImportacao:
++    criados: int = 0
++    atualizados: int = 0
++    sem_alteracao: int = 0
++    movimentacoes: int = 0
++
++
++def _buscar_existentes(codigos):
++    """Produtos já cadastrados, por código de barras (com a linha travada)."""
++    encontrados = defaultdict(list)
++    for inicio in range(0, len(codigos), LOTE_CONSULTA):
++        parte = codigos[inicio : inicio + LOTE_CONSULTA]
++        consulta = (
++            Produto.objects.select_for_update()
++            .filter(codigo_barras__in=parte)
++            .order_by("pk")
++        )
++        for produto in consulta:
++            encontrados[produto.codigo_barras].append(produto)
++    return encontrados
++
++
++@transaction.atomic
++def importar_produtos(linhas, usuario):
++    """
++    Grava as linhas validadas. Tudo ou nada: qualquer exceção desfaz tudo.
++    Levanta ImportacaoInvalida se o cadastro tiver código de barras repetido
++    (a importação não tem como saber qual produto atualizar).
++    """
++    resultado = ResultadoImportacao()
++    existentes = _buscar_existentes([linha["codigo"] for linha in linhas])
++
++    ambiguos = [
++        f"Linha {linha['linha']}: o código {linha['codigo']} está em "
++        f"{len(existentes[linha['codigo']])} produtos do cadastro. "
++        "Corrija o cadastro antes de importar."
++        for linha in linhas
++        if len(existentes.get(linha["codigo"], ())) > 1
++    ]
++    if ambiguos:
++        raise ImportacaoInvalida(ambiguos)
++
++    novos, linhas_novas = [], []
++    para_atualizar, ajustes = [], []
++    agora = timezone.now()
++
++    for linha in linhas:
++        lista = existentes.get(linha["codigo"])
++        if lista:
++            produto = lista[0]
++            mudou = False
++            if produto.preco_venda != linha["preco_venda"]:
++                produto.preco_venda = linha["preco_venda"]
++                mudou = True
++            if linha["preco_custo"] is not None and produto.preco_custo != linha["preco_custo"]:
++                produto.preco_custo = linha["preco_custo"]
++                mudou = True
++            if mudou:
++                produto.atualizado_em = agora
++                para_atualizar.append(produto)
++            if (produto.quantidade or 0) != linha["estoque"]:
++                ajustes.append(
++                    (produto.pk, MovimentacaoEstoque.Tipo.AJUSTE, linha["estoque"])
++                )
++            if mudou or (produto.quantidade or 0) != linha["estoque"]:
++                resultado.atualizados += 1
++            else:
++                resultado.sem_alteracao += 1
++        else:
++            novos.append(
++                Produto(
++                    nome=linha["nome"],
++                    codigo_barras=linha["codigo"],
++                    categoria=linha["categoria"] or "",
++                    fornecedor=linha["fornecedor"] or "",
++                    estoque_minimo=linha["estoque_minimo"] or 0,
++                    preco_custo=linha["preco_custo"],
++                    preco_venda=linha["preco_venda"],
++                    ativo=True if linha["ativo"] is None else linha["ativo"],
++                    quantidade=0,  # o estoque inicial entra por movimentação
++                )
++            )
++            linhas_novas.append(linha)
++
++    # Preços: bulk_update sem o campo "quantidade" (que só muda por movimentação).
++    if para_atualizar:
++        Produto.objects.bulk_update(
++            para_atualizar,
++            ["preco_venda", "preco_custo", "atualizado_em"],
++            batch_size=1000,
++        )
++
++    if novos:
++        Produto.objects.bulk_create(novos, batch_size=1000)
++        resultado.criados = len(novos)
++        for produto, linha in zip(novos, linhas_novas):
++            if linha["estoque"] > 0:
++                ajustes.append(
++                    (produto.pk, MovimentacaoEstoque.Tipo.ENTRADA, linha["estoque"])
++                )
++
++    resultado.movimentacoes = MovimentacaoEstoque.registrar_lote(
++        movimentos=ajustes, usuario=usuario, observacao=OBSERVACAO
++    )
++    return resultado
+diff -ruN -x __pycache__ -x .env -x var a/produtos/tests.py b/produtos/tests.py
+--- a/produtos/tests.py	2026-11-05 17:02:14.000000000 -0300
++++ b/produtos/tests.py	2026-11-11 20:25:30.274972338 -0300
+@@ -1,3 +1,189 @@
+-from django.test import TestCase
+-
+-# Create your tests here.
++"""
++Testes da importação/exportação Excel de produtos.
++
++Rodar:  python manage.py test produtos
++(precisa do PostgreSQL configurado no .env; o Django cria um banco de teste).
++"""
++
++from decimal import Decimal
++from io import BytesIO
++
++from django.contrib.auth.models import Group, User
++from django.core.files.uploadedfile import SimpleUploadedFile
++from django.test import TestCase, override_settings
++from django.urls import reverse
++from openpyxl import Workbook, load_workbook
++
++from accounts.models import GRUPO_ADMINISTRADOR, GRUPO_VENDEDOR
++from estoque.models import MovimentacaoEstoque
++from logs.models import LogAcao
++
++from .models import Produto
++
++CABECALHO = ["Código de barras", "Nome", "Estoque", "Preço de venda", "Preço de custo"]
++
++
++def planilha(linhas, nome="produtos.xlsx"):
++    pasta = Workbook()
++    folha = pasta.active
++    for linha in linhas:
++        folha.append(linha)
++    saida = BytesIO()
++    pasta.save(saida)
++    return SimpleUploadedFile(
++        nome,
++        saida.getvalue(),
++        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++    )
++
++
++@override_settings(
++    SECURE_SSL_REDIRECT=False, SESSION_COOKIE_SECURE=False, CSRF_COOKIE_SECURE=False
++)
++class BaseTeste(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        admin_grupo = Group.objects.create(name=GRUPO_ADMINISTRADOR)
++        vend_grupo = Group.objects.create(name=GRUPO_VENDEDOR)
++        cls.admin = User.objects.create_user("admin", password="x-12345678")
++        cls.admin.groups.add(admin_grupo)
++        cls.vendedor = User.objects.create_user("vend", password="x-12345678")
++        cls.vendedor.groups.add(vend_grupo)
++
++    def setUp(self):
++        self.client.force_login(self.admin)
++
++
++class ImportarProdutosTests(BaseTeste):
++    url = reverse("produtos:importar")
++
++    def test_cria_produto_novo_com_estoque_inicial(self):
++        resposta = self.client.post(
++            self.url,
++            {"arquivo": planilha([CABECALHO, ["123", "Ração", 10, "19,90", "12,00"]])},
++        )
++        self.assertRedirects(resposta, reverse("produtos:list"))
++        produto = Produto.objects.get(codigo_barras="123")
++        self.assertEqual(produto.quantidade, 10)
++        self.assertEqual(produto.preco_venda, Decimal("19.90"))
++        movimento = produto.movimentacoes.get()
++        self.assertEqual(movimento.tipo, MovimentacaoEstoque.Tipo.ENTRADA)
++        self.assertEqual(movimento.usuario, self.admin)
++        self.assertTrue(LogAcao.objects.filter(acao=LogAcao.Acao.IMPORTACAO).exists())
++
++    def test_atualiza_preco_e_estoque_e_preserva_demais_campos(self):
++        produto = Produto.objects.create(
++            nome="Nome original",
++            codigo_barras="123",
++            categoria="Cães",
++            fornecedor="Forn",
++            estoque_minimo=3,
++            preco_venda=Decimal("10"),
++        )
++        MovimentacaoEstoque.registrar(
++            produto=produto,
++            tipo=MovimentacaoEstoque.Tipo.ENTRADA,
++            quantidade=5,
++            usuario=self.admin,
++        )
++        self.client.post(
++            self.url,
++            {"arquivo": planilha([CABECALHO, ["123", "Nome da planilha", 8, 25, None]])},
++        )
++        produto.refresh_from_db()
++        self.assertEqual(produto.quantidade, 8)
++        self.assertEqual(produto.preco_venda, Decimal("25.00"))
++        self.assertEqual(produto.nome, "Nome original")
++        self.assertEqual(produto.categoria, "Cães")
++        self.assertEqual(produto.estoque_minimo, 3)
++        ultimo = produto.movimentacoes.first()
++        self.assertEqual(ultimo.tipo, MovimentacaoEstoque.Tipo.AJUSTE)
++        self.assertEqual((ultimo.quantidade_anterior, ultimo.quantidade_nova), (5, 8))
++
++    def test_erro_em_uma_linha_nao_grava_nada(self):
++        resposta = self.client.post(
++            self.url,
++            {
++                "arquivo": planilha(
++                    [CABECALHO, ["1", "Ok", 1, 1, None], ["2", "Ruim", -3, 1, None]]
++                )
++            },
++        )
++        self.assertEqual(resposta.status_code, 200)
++        self.assertContains(resposta, "Nada foi importado")
++        self.assertEqual(Produto.objects.count(), 0)
++
++    def test_codigo_duplicado_no_cadastro_bloqueia_tudo(self):
++        Produto.objects.create(nome="A", codigo_barras="9")
++        Produto.objects.create(nome="B", codigo_barras="9")
++        resposta = self.client.post(
++            self.url,
++            {"arquivo": planilha([CABECALHO, ["9", "X", 1, 1, None], ["8", "Y", 1, 1, None]])},
++        )
++        self.assertContains(resposta, "Corrija o cadastro")
++        self.assertFalse(Produto.objects.filter(codigo_barras="8").exists())
++
++    def test_rejeita_arquivo_que_nao_e_xlsx(self):
++        resposta = self.client.post(
++            self.url, {"arquivo": SimpleUploadedFile("x.xlsx", b"texto qualquer")}
++        )
++        self.assertEqual(resposta.status_code, 200)
++        self.assertEqual(Produto.objects.count(), 0)
++
++    def test_importa_varios_produtos(self):
++        linhas = [CABECALHO] + [[str(i), f"P{i}", i % 7, 10, None] for i in range(1, 1501)]
++        self.client.post(self.url, {"arquivo": planilha(linhas)})
++        self.assertEqual(Produto.objects.count(), 1500)
++
++    def test_vendedor_nao_acessa(self):
++        self.client.force_login(self.vendedor)
++        self.assertEqual(self.client.get(self.url).status_code, 403)
++        resposta = self.client.post(
++            self.url, {"arquivo": planilha([CABECALHO, ["1", "A", 1, 1, None]])}
++        )
++        self.assertEqual(resposta.status_code, 403)
++        self.assertEqual(Produto.objects.count(), 0)
++
++    def test_anonimo_vai_para_o_login(self):
++        self.client.logout()
++        self.assertEqual(self.client.get(self.url).status_code, 302)
++
++
++class ExportarProdutosTests(BaseTeste):
++    url = reverse("produtos:exportar")
++
++    def test_baixa_xlsx_com_todos_os_produtos_inclusive_inativos(self):
++        Produto.objects.create(
++            nome="Ativo", codigo_barras="001", preco_custo=Decimal("5"), preco_venda=Decimal("9")
++        )
++        Produto.objects.create(nome="Inativo", codigo_barras="002", ativo=False)
++        resposta = self.client.get(self.url)
++        self.assertEqual(resposta.status_code, 200)
++        self.assertIn("attachment", resposta["Content-Disposition"])
++        folha = load_workbook(BytesIO(resposta.content))["Produtos"]
++        codigos = [linha[0] for linha in folha.iter_rows(min_row=2, values_only=True)]
++        self.assertEqual(sorted(codigos), ["001", "002"])
++        self.assertTrue(LogAcao.objects.filter(acao=LogAcao.Acao.EXPORTACAO).exists())
++
++    def test_vendedor_nao_exporta(self):
++        self.client.force_login(self.vendedor)
++        self.assertEqual(self.client.get(self.url).status_code, 403)
++
++    def test_exportar_e_importar_de_volta_nao_altera_nada(self):
++        produto = Produto.objects.create(
++            nome="Ração", codigo_barras="0042", preco_venda=Decimal("9.90")
++        )
++        MovimentacaoEstoque.registrar(
++            produto=produto,
++            tipo=MovimentacaoEstoque.Tipo.ENTRADA,
++            quantidade=4,
++            usuario=self.admin,
++        )
++        conteudo = self.client.get(self.url).content
++        resposta = self.client.post(
++            reverse("produtos:importar"),
++            {"arquivo": SimpleUploadedFile("volta.xlsx", conteudo)},
++            follow=True,
++        )
++        self.assertContains(resposta, "1 sem alteração")
++        self.assertEqual(produto.movimentacoes.count(), 1)  # nenhum ajuste novo
+diff -ruN -x __pycache__ -x .env -x var a/produtos/urls.py b/produtos/urls.py
+--- a/produtos/urls.py	2026-11-05 18:50:11.000000000 -0300
++++ b/produtos/urls.py	2026-11-11 20:23:55.004642198 -0300
+@@ -1,18 +1,20 @@
+-from django.urls import path
+-
+-from . import views
+-
+-app_name = "produtos"
+-
+-urlpatterns = [
+-    path("", views.ProdutoListView.as_view(), name="list"),
+-    path("novo/", views.ProdutoCreateView.as_view(), name="create"),
+-    path("<int:pk>/", views.ProdutoDetailView.as_view(), name="detail"),
+-    path("<int:pk>/editar/", views.ProdutoUpdateView.as_view(), name="update"),
+-    path(
+-        "<int:pk>/ativo/",
+-        views.ProdutoAlternarAtivoView.as_view(),
+-        name="alternar_ativo",
+-    ),
+-    path("<int:pk>/excluir/", views.ProdutoDeleteView.as_view(), name="delete"),
++from django.urls import path
++
++from . import views
++
++app_name = "produtos"
++
++urlpatterns = [
++    path("", views.ProdutoListView.as_view(), name="list"),
++    path("novo/", views.ProdutoCreateView.as_view(), name="create"),
++    path("importar/", views.ProdutoImportarView.as_view(), name="importar"),
++    path("exportar/", views.ProdutoExportarView.as_view(), name="exportar"),
++    path("<int:pk>/", views.ProdutoDetailView.as_view(), name="detail"),
++    path("<int:pk>/editar/", views.ProdutoUpdateView.as_view(), name="update"),
++    path(
++        "<int:pk>/ativo/",
++        views.ProdutoAlternarAtivoView.as_view(),
++        name="alternar_ativo",
++    ),
++    path("<int:pk>/excluir/", views.ProdutoDeleteView.as_view(), name="delete"),
+ ]
+\ No newline at end of file
+diff -ruN -x __pycache__ -x .env -x var a/produtos/views.py b/produtos/views.py
+--- a/produtos/views.py	2026-11-05 18:45:08.000000000 -0300
++++ b/produtos/views.py	2026-11-11 20:24:49.399571431 -0300
+@@ -1,159 +1,251 @@
+-from django.contrib import messages
+-from django.contrib.messages.views import SuccessMessageMixin
+-from django.db import transaction
+-from django.db.models import ProtectedError
+-from django.shortcuts import get_object_or_404, redirect
+-from django.urls import reverse, reverse_lazy
+-from django.views import View
+-from django.views.generic import (
+-    CreateView,
+-    DeleteView,
+-    DetailView,
+-    ListView,
+-    UpdateView,
+-)
+-
+-from core.mixins import (
+-    AdministradorRequiredMixin,
+-    FiltroListViewMixin,
+-    VendedorOuAdministradorRequiredMixin,
+-    eh_administrador,
+-)
+-from logs.models import LogAcao
+-from logs.utils import LogFormValidMixin, registrar_acao
+-
+-from .forms import ProdutoFiltroForm, ProdutoForm
+-from .models import Produto
+-
+-
+-class ProdutoListView(
+-    VendedorOuAdministradorRequiredMixin, FiltroListViewMixin, ListView
+-):
+-    model = Produto
+-    template_name = "produtos/produto_list.html"
+-    context_object_name = "produtos"
+-    paginate_by = 25
+-    filtro_form_class = ProdutoFiltroForm
+-
+-    def get_queryset(self):
+-        queryset = super().get_queryset()
+-        if not eh_administrador(self.request.user):
+-            queryset = queryset.filter(ativo=True)
+-        return queryset
+-
+-    def get_context_data(self, **kwargs):
+-        contexto = super().get_context_data(**kwargs)
+-        contexto["eh_administrador"] = eh_administrador(self.request.user)
+-        return contexto
+-
+-
+-class ProdutoDetailView(VendedorOuAdministradorRequiredMixin, DetailView):
+-    model = Produto
+-    template_name = "produtos/produto_detail.html"
+-    context_object_name = "produto"
+-
+-    def get_queryset(self):
+-        queryset = Produto.objects.all()
+-        if not eh_administrador(self.request.user):
+-            queryset = queryset.filter(ativo=True)
+-        return queryset
+-
+-    def get_context_data(self, **kwargs):
+-        contexto = super().get_context_data(**kwargs)
+-        administrador = eh_administrador(self.request.user)
+-        contexto["eh_administrador"] = administrador
+-        if administrador:
+-            contexto["movimentacoes"] = self.object.movimentacoes.select_related(
+-                "usuario"
+-            )[:20]
+-        return contexto
+-
+-
+-class ProdutoCreateView(
+-    AdministradorRequiredMixin, LogFormValidMixin, SuccessMessageMixin, CreateView
+-):
+-    model = Produto
+-    form_class = ProdutoForm
+-    template_name = "produtos/produto_form.html"
+-    success_message = "Produto cadastrado com sucesso."
+-    acao_log = LogAcao.Acao.CRIACAO
+-    prefixo_log = "Produto criado: "
+-    extra_context = {"titulo": "Novo produto"}
+-
+-    def get_form_kwargs(self):
+-        kwargs = super().get_form_kwargs()
+-        kwargs["usuario"] = self.request.user
+-        return kwargs
+-
+-    def get_success_url(self):
+-        return reverse("produtos:detail", kwargs={"pk": self.object.pk})
+-
+-
+-class ProdutoUpdateView(
+-    AdministradorRequiredMixin, LogFormValidMixin, SuccessMessageMixin, UpdateView
+-):
+-    model = Produto
+-    form_class = ProdutoForm
+-    template_name = "produtos/produto_form.html"
+-    success_message = "Produto atualizado com sucesso."
+-    acao_log = LogAcao.Acao.EDICAO
+-    prefixo_log = "Produto editado: "
+-    extra_context = {"titulo": "Editar produto"}
+-
+-    def get_form_kwargs(self):
+-        kwargs = super().get_form_kwargs()
+-        kwargs["usuario"] = self.request.user
+-        return kwargs
+-
+-    def get_success_url(self):
+-        return reverse("produtos:detail", kwargs={"pk": self.object.pk})
+-
+-
+-class ProdutoAlternarAtivoView(AdministradorRequiredMixin, View):
+-    """Ativa ou desativa o produto (a forma segura de 'tirar de linha')."""
+-
+-    http_method_names = ["post"]
+-
+-    def post(self, request, pk):
+-        produto = get_object_or_404(Produto, pk=pk)
+-        produto.ativo = not produto.ativo
+-        situacao = "ativado" if produto.ativo else "desativado"
+-
+-        with transaction.atomic():
+-            produto.save(update_fields=["ativo", "atualizado_em"])
+-            registrar_acao(
+-                request,
+-                LogAcao.Acao.EDICAO,
+-                f"Produto {situacao}: {produto} (#{produto.pk})",
+-            )
+-
+-        messages.success(request, f"Produto {situacao}.")
+-        return redirect("produtos:detail", pk=produto.pk)
+-
+-
+-class ProdutoDeleteView(AdministradorRequiredMixin, DeleteView):
+-    model = Produto
+-    template_name = "produtos/produto_confirm_delete.html"
+-    success_url = reverse_lazy("produtos:list")
+-
+-    def form_valid(self, form):
+-        pk = self.object.pk
+-        descricao = f"{self.object} (#{pk})"
+-        try:
+-            with transaction.atomic():
+-                resposta = super().form_valid(form)
+-                registrar_acao(
+-                    self.request,
+-                    LogAcao.Acao.EXCLUSAO,
+-                    f"Produto excluído: {descricao}",
+-                )
+-        except ProtectedError:
+-            messages.error(
+-                self.request,
+-                "Este produto tem movimentações ou vendas e não pode ser "
+-                "excluído. Desative-o.",
+-            )
+-            return redirect("produtos:detail", pk=pk)
+-
+-        messages.success(self.request, "Produto excluído.")
+-        return resposta
+\ No newline at end of file
++from django.contrib import messages
++from django.contrib.messages.views import SuccessMessageMixin
++from django.core.exceptions import ValidationError
++from django.db import transaction
++from django.db.models import ProtectedError
++from django.http import HttpResponse
++from django.shortcuts import get_object_or_404, redirect
++from django.urls import reverse, reverse_lazy
++from django.utils import timezone
++from django.views import View
++from django.views.generic import (
++    CreateView,
++    DeleteView,
++    DetailView,
++    FormView,
++    ListView,
++    UpdateView,
++)
++
++from core.mixins import (
++    AdministradorRequiredMixin,
++    FiltroListViewMixin,
++    VendedorOuAdministradorRequiredMixin,
++    eh_administrador,
++)
++from logs.models import LogAcao
++from logs.utils import LogFormValidMixin, registrar_acao
++
++from .excel import PlanilhaInvalida, gerar_xlsx, ler_planilha
++from .forms import ImportarProdutosForm, ProdutoFiltroForm, ProdutoForm
++from .importacao import ImportacaoInvalida, importar_produtos
++from .models import Produto
++
++
++class ProdutoListView(
++    VendedorOuAdministradorRequiredMixin, FiltroListViewMixin, ListView
++):
++    model = Produto
++    template_name = "produtos/produto_list.html"
++    context_object_name = "produtos"
++    paginate_by = 25
++    filtro_form_class = ProdutoFiltroForm
++
++    def get_queryset(self):
++        queryset = super().get_queryset()
++        if not eh_administrador(self.request.user):
++            queryset = queryset.filter(ativo=True)
++        return queryset
++
++    def get_context_data(self, **kwargs):
++        contexto = super().get_context_data(**kwargs)
++        contexto["eh_administrador"] = eh_administrador(self.request.user)
++        return contexto
++
++
++class ProdutoDetailView(VendedorOuAdministradorRequiredMixin, DetailView):
++    model = Produto
++    template_name = "produtos/produto_detail.html"
++    context_object_name = "produto"
++
++    def get_queryset(self):
++        queryset = Produto.objects.all()
++        if not eh_administrador(self.request.user):
++            queryset = queryset.filter(ativo=True)
++        return queryset
++
++    def get_context_data(self, **kwargs):
++        contexto = super().get_context_data(**kwargs)
++        administrador = eh_administrador(self.request.user)
++        contexto["eh_administrador"] = administrador
++        if administrador:
++            contexto["movimentacoes"] = self.object.movimentacoes.select_related(
++                "usuario"
++            )[:20]
++        return contexto
++
++
++class ProdutoCreateView(
++    AdministradorRequiredMixin, LogFormValidMixin, SuccessMessageMixin, CreateView
++):
++    model = Produto
++    form_class = ProdutoForm
++    template_name = "produtos/produto_form.html"
++    success_message = "Produto cadastrado com sucesso."
++    acao_log = LogAcao.Acao.CRIACAO
++    prefixo_log = "Produto criado: "
++    extra_context = {"titulo": "Novo produto"}
++
++    def get_form_kwargs(self):
++        kwargs = super().get_form_kwargs()
++        kwargs["usuario"] = self.request.user
++        return kwargs
++
++    def get_success_url(self):
++        return reverse("produtos:detail", kwargs={"pk": self.object.pk})
++
++
++class ProdutoUpdateView(
++    AdministradorRequiredMixin, LogFormValidMixin, SuccessMessageMixin, UpdateView
++):
++    model = Produto
++    form_class = ProdutoForm
++    template_name = "produtos/produto_form.html"
++    success_message = "Produto atualizado com sucesso."
++    acao_log = LogAcao.Acao.EDICAO
++    prefixo_log = "Produto editado: "
++    extra_context = {"titulo": "Editar produto"}
++
++    def get_form_kwargs(self):
++        kwargs = super().get_form_kwargs()
++        kwargs["usuario"] = self.request.user
++        return kwargs
++
++    def get_success_url(self):
++        return reverse("produtos:detail", kwargs={"pk": self.object.pk})
++
++
++class ProdutoAlternarAtivoView(AdministradorRequiredMixin, View):
++    """Ativa ou desativa o produto (a forma segura de 'tirar de linha')."""
++
++    http_method_names = ["post"]
++
++    def post(self, request, pk):
++        produto = get_object_or_404(Produto, pk=pk)
++        produto.ativo = not produto.ativo
++        situacao = "ativado" if produto.ativo else "desativado"
++
++        with transaction.atomic():
++            produto.save(update_fields=["ativo", "atualizado_em"])
++            registrar_acao(
++                request,
++                LogAcao.Acao.EDICAO,
++                f"Produto {situacao}: {produto} (#{produto.pk})",
++            )
++
++        messages.success(request, f"Produto {situacao}.")
++        return redirect("produtos:detail", pk=produto.pk)
++
++
++class ProdutoDeleteView(AdministradorRequiredMixin, DeleteView):
++    model = Produto
++    template_name = "produtos/produto_confirm_delete.html"
++    success_url = reverse_lazy("produtos:list")
++
++    def form_valid(self, form):
++        pk = self.object.pk
++        descricao = f"{self.object} (#{pk})"
++        try:
++            with transaction.atomic():
++                resposta = super().form_valid(form)
++                registrar_acao(
++                    self.request,
++                    LogAcao.Acao.EXCLUSAO,
++                    f"Produto excluído: {descricao}",
++                )
++        except ProtectedError:
++            messages.error(
++                self.request,
++                "Este produto tem movimentações ou vendas e não pode ser "
++                "excluído. Desative-o.",
++            )
++            return redirect("produtos:detail", pk=pk)
++
++        messages.success(self.request, "Produto excluído.")
++        return resposta
++
++
++class ProdutoImportarView(AdministradorRequiredMixin, FormView):
++    """Importa produtos de uma planilha XLSX (tudo ou nada)."""
++
++    form_class = ImportarProdutosForm
++    template_name = "produtos/produto_importar.html"
++    success_url = reverse_lazy("produtos:list")
++
++    def form_valid(self, form):
++        arquivo = form.cleaned_data["arquivo"]
++
++        try:
++            linhas, erros = ler_planilha(arquivo)
++        except PlanilhaInvalida as erro:
++            form.add_error("arquivo", str(erro))
++            return self.form_invalid(form)
++
++        if not erros:
++            try:
++                with transaction.atomic():
++                    resultado = importar_produtos(linhas, self.request.user)
++                    registrar_acao(
++                        self.request,
++                        LogAcao.Acao.IMPORTACAO,
++                        f"Importação Excel de produtos ({arquivo.name[:100]}): "
++                        f"{resultado.criados} criado(s), "
++                        f"{resultado.atualizados} atualizado(s), "
++                        f"{resultado.sem_alteracao} sem alteração, "
++                        f"{resultado.movimentacoes} movimentação(ões) de estoque.",
++                    )
++            except ImportacaoInvalida as erro:
++                erros = erro.erros
++            except ValidationError as erro:
++                erros = erro.messages
++
++        if erros:
++            return self.render_to_response(
++                self.get_context_data(form=form, erros_importacao=erros)
++            )
++
++        messages.success(
++            self.request,
++            f"Importação concluída: {resultado.criados} produto(s) criado(s), "
++            f"{resultado.atualizados} atualizado(s) e "
++            f"{resultado.sem_alteracao} sem alteração.",
++        )
++        return redirect(self.get_success_url())
++
++
++class ProdutoExportarView(AdministradorRequiredMixin, View):
++    """Baixa todos os produtos em XLSX (inclui preço de custo: só administrador)."""
++
++    http_method_names = ["get"]
++
++    def get(self, request):
++        registros = list(
++            Produto.objects.order_by("nome", "id").values_list(
++                "codigo_barras",
++                "nome",
++                "categoria",
++                "fornecedor",
++                "quantidade",
++                "estoque_minimo",
++                "preco_custo",
++                "preco_venda",
++                "ativo",
++            )
++        )
++        conteudo = gerar_xlsx(registros)
++        registrar_acao(
++            request,
++            LogAcao.Acao.EXPORTACAO,
++            f"Exportação Excel de produtos: {len(registros)} produto(s).",
++        )
++
++        nome = f"produtos_{timezone.localtime():%Y%m%d_%H%M}.xlsx"
++        resposta = HttpResponse(
++            conteudo,
++            content_type=(
++                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
++            ),
++        )
++        resposta["Content-Disposition"] = f'attachment; filename="{nome}"'
++        resposta["Cache-Control"] = "no-store"  # contém preço de custo
++        return resposta
+diff -ruN -x __pycache__ -x .env -x var a/requirements.txt b/requirements.txt
+--- a/requirements.txt	2026-11-05 17:01:20.000000000 -0300
++++ b/requirements.txt	2026-11-11 20:23:55.004420004 -0300
+@@ -1,5 +1,6 @@
+-Django>=5.2,<5.3
+-psycopg[binary]>=3.2,<4.0
+-gunicorn>=23.0
+-whitenoise>=6.9
+-python-decouple>=3.8
+\ No newline at end of file
++Django>=5.2,<5.3
++psycopg[binary]>=3.2,<4.0
++gunicorn>=23.0
++whitenoise>=6.9
++python-decouple>=3.8
++openpyxl>=3.1,<4.0
+diff -ruN -x __pycache__ -x .env -x var a/templates/base.html b/templates/base.html
+--- a/templates/base.html	2026-11-05 18:56:52.000000000 -0300
++++ b/templates/base.html	2026-11-11 20:23:55.005122169 -0300
+@@ -1,89 +1,96 @@
+-{% load static core_tags %}<!doctype html>
+-<html lang="pt-br">
+-<head>
+-  <meta charset="utf-8">
+-  <meta name="viewport" content="width=device-width, initial-scale=1">
+-  <title>{% block title %}Pet Shop ERP{% endblock %} · Pet Shop ERP</title>
+-  <link rel="stylesheet" href="{% static 'vendor/bootstrap/bootstrap.min.css' %}">
+-  <link rel="stylesheet" href="{% static 'css/app.css' %}">
+-  {% block extra_head %}{% endblock %}
+-</head>
+-<body class="bg-body-tertiary">
+-{% with ns=request.resolver_match.namespace %}
+-<nav class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top d-print-none">
+-  <div class="container-fluid px-3 px-lg-4">
+-    <a class="navbar-brand" href="{% url 'core:home' %}">Pet Shop ERP</a>
+-
+-    {% if user.is_authenticated %}
+-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+-            data-bs-target="#menuPrincipal" aria-controls="menuPrincipal"
+-            aria-expanded="false" aria-label="Abrir menu">
+-      <span class="navbar-toggler-icon"></span>
+-    </button>
+-
+-    <div class="collapse navbar-collapse" id="menuPrincipal">
+-      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+-        {% if user|eh_administrador %}
+-        <li class="nav-item"><a class="nav-link {% if ns == 'dashboard' %}active{% endif %}" href="{% url 'dashboard:index' %}">Dashboard</a></li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'produtos' %}active{% endif %}" href="{% url 'produtos:list' %}">Produtos</a></li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'estoque' %}active{% endif %}" href="{% url 'estoque:list' %}">Estoque</a></li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'vendas' %}active{% endif %}" href="{% url 'vendas:list' %}">Vendas</a></li>
+-        <li class="nav-item dropdown">
+-          <a class="nav-link dropdown-toggle {% if ns == 'financeiro' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">Financeiro</a>
+-          <ul class="dropdown-menu">
+-            <li><a class="dropdown-item" href="{% url 'financeiro:pagar_list' %}">Contas a pagar</a></li>
+-            <li><a class="dropdown-item" href="{% url 'financeiro:receber_list' %}">Contas a receber</a></li>
+-            <li><a class="dropdown-item" href="{% url 'financeiro:caixa_list' %}">Fluxo de caixa</a></li>
+-          </ul>
+-        </li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'accounts' %}active{% endif %}" href="{% url 'accounts:usuario_list' %}">Usuários</a></li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'logs' %}active{% endif %}" href="{% url 'logs:list' %}">Logs</a></li>
+-        {% else %}
+-        <li class="nav-item"><a class="nav-link {% if ns == 'core' %}active{% endif %}" href="{% url 'core:home' %}">Início</a></li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'produtos' %}active{% endif %}" href="{% url 'produtos:list' %}">Produtos</a></li>
+-        <li class="nav-item"><a class="nav-link {% if ns == 'vendas' %}active{% endif %}" href="{% url 'vendas:list' %}">Minhas vendas</a></li>
+-        {% endif %}
+-        <li class="nav-item ms-lg-2"><a class="btn btn-light btn-sm mt-1 mt-lg-0" href="{% url 'vendas:create' %}">Nova venda</a></li>
+-      </ul>
+-
+-      <ul class="navbar-nav">
+-        <li class="nav-item dropdown">
+-          <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+-            {{ user.get_full_name|default:user.username }}
+-          </a>
+-          <ul class="dropdown-menu dropdown-menu-end">
+-            <li><span class="dropdown-item-text small text-muted">{% if user|eh_administrador %}Administrador{% else %}Vendedor{% endif %}</span></li>
+-            <li><a class="dropdown-item" href="{% url 'accounts:alterar_senha' %}">Alterar senha</a></li>
+-            {% if user.is_staff %}
+-            <li><a class="dropdown-item" href="{% url 'admin:index' %}">Painel do Django</a></li>
+-            {% endif %}
+-            <li><hr class="dropdown-divider"></li>
+-            <li>
+-              <form method="post" action="{% url 'accounts:logout' %}">
+-                {% csrf_token %}
+-                <button type="submit" class="dropdown-item">Sair</button>
+-              </form>
+-            </li>
+-          </ul>
+-        </li>
+-      </ul>
+-    </div>
+-    {% else %}
+-    <a class="btn btn-light btn-sm" href="{% url 'accounts:login' %}">Entrar</a>
+-    {% endif %}
+-  </div>
+-</nav>
+-{% endwith %}
+-
+-<main class="container-fluid px-3 px-lg-4 py-3">
+-  {% include "partials/mensagens.html" %}
+-  {% block content %}{% endblock %}
+-</main>
+-
+-<footer class="text-center text-muted small py-3 d-print-none">Pet Shop ERP</footer>
+-
+-<script src="{% static 'vendor/bootstrap/bootstrap.bundle.min.js' %}"></script>
+-<script src="{% static 'js/app.js' %}"></script>
+-{% block extra_js %}{% endblock %}
+-</body>
++{% load static core_tags %}<!doctype html>
++<html lang="pt-br">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <title>{% block title %}Pet Shop ERP{% endblock %} · Pet Shop ERP</title>
++  <link rel="stylesheet" href="{% static 'vendor/bootstrap/bootstrap.min.css' %}">
++  <link rel="stylesheet" href="{% static 'css/app.css' %}">
++  {% block extra_head %}{% endblock %}
++</head>
++<body class="bg-body-tertiary">
++{% with ns=request.resolver_match.namespace %}
++<nav class="navbar navbar-expand-lg navbar-dark bg-primary sticky-top d-print-none">
++  <div class="container-fluid px-3 px-lg-4">
++    <a class="navbar-brand" href="{% url 'core:home' %}">Pet Shop ERP</a>
++
++    {% if user.is_authenticated %}
++    <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
++            data-bs-target="#menuPrincipal" aria-controls="menuPrincipal"
++            aria-expanded="false" aria-label="Abrir menu">
++      <span class="navbar-toggler-icon"></span>
++    </button>
++
++    <div class="collapse navbar-collapse" id="menuPrincipal">
++      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
++        {% if user|eh_administrador %}
++        <li class="nav-item"><a class="nav-link {% if ns == 'dashboard' %}active{% endif %}" href="{% url 'dashboard:index' %}">Dashboard</a></li>
++        <li class="nav-item dropdown">
++          <a class="nav-link dropdown-toggle {% if ns == 'produtos' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">Produtos</a>
++          <ul class="dropdown-menu">
++            <li><a class="dropdown-item" href="{% url 'produtos:list' %}">Lista de produtos</a></li>
++            <li><a class="dropdown-item" href="{% url 'produtos:importar' %}">Importar Excel</a></li>
++            <li><a class="dropdown-item" href="{% url 'produtos:exportar' %}">Exportar Excel</a></li>
++          </ul>
++        </li>
++        <li class="nav-item"><a class="nav-link {% if ns == 'estoque' %}active{% endif %}" href="{% url 'estoque:list' %}">Estoque</a></li>
++        <li class="nav-item"><a class="nav-link {% if ns == 'vendas' %}active{% endif %}" href="{% url 'vendas:list' %}">Vendas</a></li>
++        <li class="nav-item dropdown">
++          <a class="nav-link dropdown-toggle {% if ns == 'financeiro' %}active{% endif %}" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">Financeiro</a>
++          <ul class="dropdown-menu">
++            <li><a class="dropdown-item" href="{% url 'financeiro:pagar_list' %}">Contas a pagar</a></li>
++            <li><a class="dropdown-item" href="{% url 'financeiro:receber_list' %}">Contas a receber</a></li>
++            <li><a class="dropdown-item" href="{% url 'financeiro:caixa_list' %}">Fluxo de caixa</a></li>
++          </ul>
++        </li>
++        <li class="nav-item"><a class="nav-link {% if ns == 'accounts' %}active{% endif %}" href="{% url 'accounts:usuario_list' %}">Usuários</a></li>
++        <li class="nav-item"><a class="nav-link {% if ns == 'logs' %}active{% endif %}" href="{% url 'logs:list' %}">Logs</a></li>
++        {% else %}
++        <li class="nav-item"><a class="nav-link {% if ns == 'core' %}active{% endif %}" href="{% url 'core:home' %}">Início</a></li>
++        <li class="nav-item"><a class="nav-link {% if ns == 'produtos' %}active{% endif %}" href="{% url 'produtos:list' %}">Produtos</a></li>
++        <li class="nav-item"><a class="nav-link {% if ns == 'vendas' %}active{% endif %}" href="{% url 'vendas:list' %}">Minhas vendas</a></li>
++        {% endif %}
++        <li class="nav-item ms-lg-2"><a class="btn btn-light btn-sm mt-1 mt-lg-0" href="{% url 'vendas:create' %}">Nova venda</a></li>
++      </ul>
++
++      <ul class="navbar-nav">
++        <li class="nav-item dropdown">
++          <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
++            {{ user.get_full_name|default:user.username }}
++          </a>
++          <ul class="dropdown-menu dropdown-menu-end">
++            <li><span class="dropdown-item-text small text-muted">{% if user|eh_administrador %}Administrador{% else %}Vendedor{% endif %}</span></li>
++            <li><a class="dropdown-item" href="{% url 'accounts:alterar_senha' %}">Alterar senha</a></li>
++            {% if user.is_staff %}
++            <li><a class="dropdown-item" href="{% url 'admin:index' %}">Painel do Django</a></li>
++            {% endif %}
++            <li><hr class="dropdown-divider"></li>
++            <li>
++              <form method="post" action="{% url 'accounts:logout' %}">
++                {% csrf_token %}
++                <button type="submit" class="dropdown-item">Sair</button>
++              </form>
++            </li>
++          </ul>
++        </li>
++      </ul>
++    </div>
++    {% else %}
++    <a class="btn btn-light btn-sm" href="{% url 'accounts:login' %}">Entrar</a>
++    {% endif %}
++  </div>
++</nav>
++{% endwith %}
++
++<main class="container-fluid px-3 px-lg-4 py-3">
++  {% include "partials/mensagens.html" %}
++  {% block content %}{% endblock %}
++</main>
++
++<footer class="text-center text-muted small py-3 d-print-none">Pet Shop ERP</footer>
++
++<script src="{% static 'vendor/bootstrap/bootstrap.bundle.min.js' %}"></script>
++<script src="{% static 'js/app.js' %}"></script>
++{% block extra_js %}{% endblock %}
++</body>
+ </html>
+\ No newline at end of file
+diff -ruN -x __pycache__ -x .env -x var a/templates/produtos/produto_importar.html b/templates/produtos/produto_importar.html
+--- a/templates/produtos/produto_importar.html	1969-12-31 21:00:00.000000000 -0300
++++ b/templates/produtos/produto_importar.html	2026-11-11 15:10:50.778577004 -0300
+@@ -0,0 +1,48 @@
++{% extends "base.html" %}
++{% block title %}Importar produtos{% endblock %}
++{% block content %}
++<div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
++  <h1 class="h3 mb-0">Importar produtos (Excel)</h1>
++  <a class="btn btn-outline-secondary" href="{% url 'produtos:list' %}">Voltar</a>
++</div>
++
++{% if erros_importacao %}
++<div class="alert alert-danger" role="alert">
++  <strong>Nada foi importado.</strong> Corrija a planilha e envie novamente:
++  <ul class="mb-0 mt-2">
++    {% for erro in erros_importacao %}<li>{{ erro }}</li>{% endfor %}
++  </ul>
++</div>
++{% endif %}
++
++<div class="row g-3">
++  <div class="col-lg-7">
++    <div class="card"><div class="card-body">
++      <form method="post" enctype="multipart/form-data" novalidate data-evitar-duplo-envio>
++        {% csrf_token %}
++        {% include "partials/form_corpo.html" with coluna="col-12" %}
++        <div class="d-flex gap-2 mt-4">
++          <button type="submit" class="btn btn-primary">Importar</button>
++          <a class="btn btn-outline-secondary" href="{% url 'produtos:list' %}">Cancelar</a>
++        </div>
++      </form>
++    </div></div>
++  </div>
++
++  <div class="col-lg-5">
++    <div class="card"><div class="card-body small">
++      <h2 class="h6">Como funciona</h2>
++      <ul class="mb-2">
++        <li>Colunas obrigatórias: <strong>Código de barras, Nome, Estoque, Preço de venda</strong>.</li>
++        <li>Opcionais: Categoria, Fornecedor, Estoque mínimo, Preço de custo, Ativo.</li>
++        <li>O produto é identificado pelo <strong>código de barras</strong>.</li>
++        <li><strong>Produto existente:</strong> atualiza preço e estoque (o estoque da planilha vira o saldo, como um ajuste de contagem). Os demais campos são preservados.</li>
++        <li><strong>Produto novo:</strong> é cadastrado; o estoque entra como “estoque inicial”.</li>
++        <li>Se houver qualquer erro, nada é gravado.</li>
++        <li>Formate a coluna de código de barras como <em>Texto</em> para não perder zeros à esquerda.</li>
++      </ul>
++      <a href="{% url 'produtos:exportar' %}">Baixar a planilha atual como modelo</a>
++    </div></div>
++  </div>
++</div>
++{% endblock %}

@@ -1,0 +1,4 @@
+{% if conta.atrasada %}<span class="badge text-bg-danger">Atrasada</span>
+{% elif conta.status == "PENDENTE" %}<span class="badge text-bg-warning">Pendente</span>
+{% elif conta.status == "CANCELADO" %}<span class="badge text-bg-secondary">Cancelada</span>
+{% else %}<span class="badge text-bg-success">{{ conta.get_status_display }}</span>{% endif %}

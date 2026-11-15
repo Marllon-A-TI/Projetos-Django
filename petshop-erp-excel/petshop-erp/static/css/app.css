@@ -1,0 +1,43 @@
+.navbar-brand {
+  letter-spacing: 0.3px;
+  font-weight: 600;
+}
+
+.text-money {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.kpi-valor {
+  font-size: 1.6rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.venda-total {
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.table-actions form {
+  display: inline;
+}
+
+.table > :not(caption) > * > * {
+  vertical-align: middle;
+}
+
+@media print {
+  body {
+    background: #fff !important;
+  }
+
+  .card {
+    border: 0 !important;
+    box-shadow: none !important;
+  }
+}
+.grafico-box {
+  position: relative;
+  height: 320px;
+}
